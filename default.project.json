@@ -1,0 +1,11 @@
+{
+  "name": "roblox-game",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "UltQ": {
+        "$path": "src/UltQ"
+      }
+    }
+  }
+}

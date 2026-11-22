@@ -1,0 +1,2164 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4"><External>null</External><External>nil</External><Item class="Script" referent="RBX00000009"><Properties><string name="Name">UltQ</string><ProtectedString name="Source"><![CDATA[-- UltQ server / installer.
+-- Drop the UltQ model into ServerScriptService. On start this script:
+--   * copies the Shared modules to ReplicatedStorage (as "UltQShared") so clients can use them
+--   * creates the RemoteEvent "UltQRemote"
+--   * gives every player the UltQClient LocalScript (inside a ScreenGui that survives respawns)
+--   * owns the cooldown, freezes the caster, and (optionally) deals damage at the impact.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local shared = script:WaitForChild("Shared")
+local existing = ReplicatedStorage:FindFirstChild("UltQShared")
+if existing then
+	existing:Destroy()
+end
+local sharedCopy = shared:Clone()
+sharedCopy.Name = "UltQShared"
+sharedCopy.Parent = ReplicatedStorage
+
+local Config = require(sharedCopy:WaitForChild("Config"))
+
+local remote = ReplicatedStorage:FindFirstChild("UltQRemote") :: RemoteEvent?
+if not remote then
+	local r = Instance.new("RemoteEvent")
+	r.Name = "UltQRemote"
+	r.Parent = ReplicatedStorage
+	remote = r
+end
+assert(remote)
+
+local clientTemplate = script:WaitForChild("UltQClient")
+
+local function giveClient(player: Player)
+	local pg = player:WaitForChild("PlayerGui", 30)
+	if not pg or pg:FindFirstChild("UltQ") then
+		return
+	end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "UltQ"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 1000
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	local ls = clientTemplate:Clone()
+	ls.Parent = gui
+	gui.Parent = pg
+end
+
+Players.PlayerAdded:Connect(giveClient)
+for _, p in Players:GetPlayers() do
+	task.spawn(giveClient, p)
+end
+
+local lastCast: { [Player]: number } = {}
+
+local function damageAround(caster: Player, center: Vector3)
+	for _, model in workspace:GetDescendants() do
+		if model:IsA("Humanoid") and model.Parent ~= caster.Character and model.Health > 0 then
+			local root = model.Parent and model.Parent:FindFirstChild("HumanoidRootPart")
+			if root and root:IsA("BasePart") and (root.Position - center).Magnitude <= Config.DamageRadius then
+				model:TakeDamage(Config.Damage)
+			end
+		end
+	end
+end
+
+remote.OnServerEvent:Connect(function(player: Player, action: any)
+	if action ~= "cast" then
+		return
+	end
+	local now = os.clock()
+	if lastCast[player] and now - lastCast[player] < Config.Cooldown then
+		return
+	end
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hum or hum.Health <= 0 or not hrp or not hrp:IsA("BasePart") then
+		return
+	end
+	lastCast[player] = now
+	remote:FireAllClients("cast", player, hrp.CFrame)
+
+	if Config.LockMovement then
+		hrp.Anchored = true
+		task.delay(Config.Duration, function()
+			if hrp.Parent then
+				hrp.Anchored = false
+			end
+		end)
+	end
+	if Config.Damage > 0 then
+		task.delay(Config.HitTime, function()
+			if hrp.Parent then
+				damageAround(player, hrp.Position)
+			end
+		end)
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+	lastCast[p] = nil
+end)
+]]></ProtectedString><token name="RunContext">0</token></Properties><Item class="Folder" referent="RBX00000007"><Properties><string name="Name">Shared</string></Properties><Item class="ModuleScript" referent="RBX00000001"><Properties><string name="Name">Cinematic</string><ProtectedString name="Source"><![CDATA[-- Cinematic: plays the ult for the local player.
+-- Builds the 15 shot sets far above the map (local-only parts), drives a scripted camera
+-- through the cut list, and layers the compositor-style post effects (bloom, flashes, glitch
+-- bars, pink duotone, B/W impact frames, fade) using Lighting effects + a ScreenGui overlay.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local StarterGui = game:GetService("StarterGui")
+local SoundService = game:GetService("SoundService")
+
+local Kit = require(script.Parent.Kit)
+local Shots = require(script.Parent.Shots)
+local Config = require(script.Parent.Config)
+
+local Cinematic = {}
+
+local STAGE_BASE = CFrame.new(0, 4000, 0)
+local SET_SPACING = 450
+
+-- Post timelines (ported from the Blender compositor keys) ---------------------------------
+local EXPOSURE = Kit.track({
+	{ 0.0, 0, "const" }, { 0.22, 1.2 }, { 0.27, 0, "const" }, { 0.67, 0.8 }, { 0.75, 0.2, "const" },
+	{ 0.83, 0, "const" }, { 1.0, 1.4 }, { 1.08, 0, "const" }, { 1.97, 1.0 }, { 2.05, 0, "const" },
+	{ 2.79, 0.3 }, { 2.83, 1.6 }, { 3.0, 1.2 }, { 3.08, 0, "const" }, { 3.47, 1.5 }, { 3.55, -0.5 },
+	{ 3.62, -2.0 }, { 3.80, 0, "const" }, { 5.6, 0 }, { 6.0, 1.5 }, { 6.1, 0.2 }, { 6.28, 1.0 },
+	{ 6.37, 4.0, "const" }, { 6.40, 0, "const" }, { 7.20, 0 }, { 7.25, 1.0 }, { 7.40, 0, "const" },
+})
+local GLITCH = Kit.track({
+	{ 0.0, 0, "const" }, { 0.22, 90, "const" }, { 0.29, 0, "const" }, { 0.43, 60, "const" }, { 0.47, 0, "const" },
+	{ 0.60, 40, "const" }, { 0.63, 0, "const" }, { 0.67, 120, "const" }, { 0.70, 0, "const" }, { 0.83, 160, "const" },
+	{ 0.86, 70, "const" }, { 0.89, 140, "const" }, { 0.92, 0, "const" }, { 1.43, 60, "const" }, { 1.47, 0, "const" },
+	{ 1.94, 50, "const" }, { 1.97, 0, "const" }, { 2.70, 80, "const" }, { 2.76, 0, "const" }, { 3.60, 90, "const" },
+	{ 3.66, 0, "const" }, { 5.97, 120, "const" }, { 6.0, 0, "const" }, { 6.05, 150, "const" }, { 6.12, 0, "const" },
+	{ 7.40, 140, "const" }, { 7.47, 0, "const" },
+})
+local BLOOM = Kit.track({
+	{ 0.0, 1.0, "const" }, { 2.83, 2.0, "const" }, { 3.0, 1.0, "const" }, { 6.0, 1.8, "const" }, { 6.40, 1.0, "const" }, { 7.25, 2.2, "const" },
+})
+local FADE = Kit.track({ { 0, 0 }, { 7.45, 0 }, { 7.70, 1 } })
+
+local function overlayFrame(parent: Instance, name: string, color: Color3, z: number): Frame
+	local f = Instance.new("Frame")
+	f.Name = name
+	f.BorderSizePixel = 0
+	f.BackgroundColor3 = color
+	f.BackgroundTransparency = 1
+	f.Size = UDim2.fromScale(1, 1)
+	f.ZIndex = z
+	f.Parent = parent
+	return f
+end
+
+local function hideCoreGui()
+	local states = {}
+	for _, ty in Enum.CoreGuiType:GetEnumItems() do
+		if ty ~= Enum.CoreGuiType.All then
+			local ok, on = pcall(StarterGui.GetCoreGuiEnabled, StarterGui, ty)
+			states[ty] = ok and on
+		end
+	end
+	pcall(StarterGui.SetCoreGuiEnabled, StarterGui, Enum.CoreGuiType.All, false)
+	return function()
+		for ty, on in states do
+			pcall(StarterGui.SetCoreGuiEnabled, StarterGui, ty, on)
+		end
+	end
+end
+
+local function hideOtherGuis(gui: Instance)
+	local hidden = {}
+	local pg = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if pg then
+		for _, g in pg:GetChildren() do
+			if g:IsA("ScreenGui") and g ~= gui and g.Enabled then
+				g.Enabled = false
+				table.insert(hidden, g)
+			end
+		end
+	end
+	return function()
+		for _, g in hidden do
+			if g.Parent then
+				g.Enabled = true
+			end
+		end
+	end
+end
+
+-- Optional: play a pre-rendered video instead (Config.VideoId)
+function Cinematic.playVideo(gui: ScreenGui, onDone: () -> ())
+	local restoreCore = hideCoreGui()
+	local restoreGuis = hideOtherGuis(gui)
+	local vf = Instance.new("VideoFrame")
+	vf.Size = UDim2.fromScale(1, 1)
+	vf.BackgroundColor3 = Color3.new(0, 0, 0)
+	vf.BorderSizePixel = 0
+	vf.Video = Config.VideoId
+	vf.Volume = Config.Volume
+	vf.ZIndex = 50
+	vf.Parent = gui
+	local done = false
+	local function finish()
+		if done then
+			return
+		end
+		done = true
+		vf:Destroy()
+		restoreCore()
+		restoreGuis()
+		onDone()
+	end
+	vf.Ended:Connect(finish)
+	task.spawn(function()
+		local t = 0
+		while not vf.IsLoaded and t < 5 and not done do
+			t += task.wait(0.05)
+		end
+		if not done then
+			vf:Play()
+		end
+	end)
+	task.delay(Config.Duration + 6, finish)
+end
+
+function Cinematic.play(character: Model, gui: ScreenGui, onDone: () -> ())
+	if Config.VideoId ~= "" then
+		Cinematic.playVideo(gui, onDone)
+		return
+	end
+	local cam = workspace.CurrentCamera
+	local saved = { type = cam.CameraType, subject = cam.CameraSubject, fov = cam.FieldOfView }
+
+	-- lighting ---------------------------------------------------------------------------
+	local LIGHT_PROPS = { "Ambient", "OutdoorAmbient", "Brightness", "ClockTime", "FogEnd", "FogStart", "FogColor",
+		"ExposureCompensation", "EnvironmentDiffuseScale", "EnvironmentSpecularScale", "GlobalShadows" }
+	local savedLight = {}
+	for _, k in LIGHT_PROPS do
+		savedLight[k] = (Lighting :: any)[k]
+	end
+	local disabled = {}
+	for _, e in Lighting:GetChildren() do
+		if e:IsA("PostEffect") and e.Enabled then
+			e.Enabled = false
+			table.insert(disabled, e)
+		end
+	end
+	local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+	if atmosphere then
+		atmosphere.Parent = nil
+	end
+	Lighting.Ambient = Color3.fromRGB(16, 22, 48)
+	Lighting.OutdoorAmbient = Color3.fromRGB(16, 22, 48)
+	Lighting.Brightness = 0
+	Lighting.ClockTime = 0
+	Lighting.FogStart = 0
+	Lighting.FogEnd = 100000
+	Lighting.ExposureCompensation = 0
+	Lighting.EnvironmentDiffuseScale = 0
+	Lighting.EnvironmentSpecularScale = 0.4
+	Lighting.GlobalShadows = false
+
+	local bloom = Instance.new("BloomEffect")
+	bloom.Name = "UltQBloom"
+	bloom.Size = 40
+	bloom.Threshold = 0.8
+	bloom.Parent = Lighting
+	local cc = Instance.new("ColorCorrectionEffect")
+	cc.Name = "UltQGrade"
+	cc.Parent = Lighting
+
+	-- UI ----------------------------------------------------------------------------------
+	local restoreCore = hideCoreGui()
+	local restoreGuis = hideOtherGuis(gui)
+	local layer = Instance.new("Frame")
+	layer.Name = "UltQOverlay"
+	layer.BackgroundTransparency = 1
+	layer.Size = UDim2.fromScale(1, 1)
+	layer.ZIndex = 40
+	layer.Parent = gui
+	local flash = overlayFrame(layer, "Flash", Color3.fromRGB(225, 240, 255), 41)
+	local dark = overlayFrame(layer, "Dark", Color3.new(0, 0, 0), 42)
+	local fade = overlayFrame(layer, "Fade", Color3.new(0, 0, 0), 45)
+	local bars = {}
+	for i = 1, 12 do
+		local b = overlayFrame(layer, "Glitch" .. i, Color3.new(1, 1, 1), 43)
+		b.Visible = false
+		bars[i] = b
+	end
+
+	-- sets ----------------------------------------------------------------------------------
+	local root = Instance.new("Folder")
+	root.Name = "UltQStage"
+	root.Parent = workspace
+	local ctxs = {}
+	local queue = {}
+	for i, name in Shots.SET_ORDER do
+		table.insert(queue, { name, STAGE_BASE * CFrame.new(i * SET_SPACING, 0, 0) })
+	end
+	local function build(name: string)
+		if ctxs[name] then
+			return ctxs[name]
+		end
+		for i, q in queue do
+			if q[1] == name then
+				table.remove(queue, i)
+				local ctx = Shots.newCtx(root, q[2], character, name)
+				Shots.Sets[name](ctx)
+				ctxs[name] = ctx
+				return ctx
+			end
+		end
+		return nil
+	end
+	build("S01")
+	build("S02")
+
+	local sound: Sound? = nil
+	if Config.SoundId ~= "" then
+		local s = Instance.new("Sound")
+		s.Name = "UltQSound"
+		s.SoundId = Config.SoundId
+		s.Volume = Config.Volume
+		s.Parent = SoundService
+		s:Play()
+		sound = s
+	end
+
+	cam.CameraType = Enum.CameraType.Scriptable
+	local t0 = os.clock()
+	local finished = false
+	local diedConn: RBXScriptConnection? = nil
+
+	local function finish()
+		if finished then
+			return
+		end
+		finished = true
+		RunService:UnbindFromRenderStep("UltQCinematic")
+		if diedConn then
+			diedConn:Disconnect()
+		end
+		for _, ctx in ctxs do
+			ctx:destroy()
+		end
+		root:Destroy()
+		layer:Destroy()
+		bloom:Destroy()
+		cc:Destroy()
+		for _, e in disabled do
+			if e.Parent then
+				e.Enabled = true
+			end
+		end
+		if atmosphere then
+			atmosphere.Parent = Lighting
+		end
+		for k, v in savedLight do
+			pcall(function()
+				(Lighting :: any)[k] = v
+			end)
+		end
+		restoreCore()
+		restoreGuis()
+		local char = Players.LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		cam.CameraType = saved.type == Enum.CameraType.Scriptable and Enum.CameraType.Custom or saved.type
+		cam.CameraSubject = hum or saved.subject
+		cam.FieldOfView = saved.fov
+		if sound then
+			local s = sound
+			task.delay(1.5, function()
+				s:Destroy()
+			end)
+		end
+		onDone()
+	end
+
+	local hum = character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		diedConn = hum.Died:Connect(finish)
+	end
+
+	local step
+	RunService:BindToRenderStep("UltQCinematic", Enum.RenderPriority.Camera.Value + 1, function()
+		local ok, err = pcall(step)
+		if not ok then
+			warn("[UltQ] cinematic error, restoring camera:", err)
+			finish()
+		end
+	end)
+
+	step = function()
+		local t = os.clock() - t0
+		if t >= Config.Duration or not character.Parent then
+			finish()
+			return
+		end
+		local frame = math.floor(t * 60)
+
+		-- active shot
+		local shot = Shots.LIST[1]
+		for _, s in Shots.LIST do
+			if t >= s[2] then
+				shot = s
+			end
+		end
+		local ctx = build(shot[4]) or ctxs[shot[4]]
+		-- build one queued set per frame so the start doesn't hitch
+		if #queue > 0 then
+			build(queue[1][1])
+		end
+		ctx:update(t)
+
+		-- camera
+		local def
+		for _, c in ctxs do
+			if c.cams[shot[1]] then
+				def = c.cams[shot[1]]
+			end
+		end
+		if def then
+			local cf = CFrame.lookAt(def.pos(t), def.target(t)) * CFrame.Angles(0, 0, math.rad(def.roll(t)))
+			local sh = def.shake
+			if sh and t >= sh[1] and t <= sh[2] then
+				local step = math.floor(t * 30 / (sh[5] or 1))
+				local k = 1 - 0.5 * Kit.prog(t, sh[1], sh[2])
+				cf = cf
+					* CFrame.new(Kit.hash(step, 1) * sh[3] * k, Kit.hash(step, 2) * sh[3] * k, 0)
+					* CFrame.Angles(0, 0, math.rad(Kit.hash(step, 3) * sh[4] * k))
+			end
+			local g = GLITCH(t)
+			if g > 0 then
+				cf = cf * CFrame.new(Kit.hash(frame, 7) * g / 900, 0, 0)
+			end
+			cam.CFrame = cf
+			cam.FieldOfView = def.fov
+		end
+
+		-- post --------------------------------------------------------------------------
+		local e = EXPOSURE(t)
+		flash.BackgroundTransparency = 1 - math.clamp(e / 4.5, 0, 0.85)
+		dark.BackgroundTransparency = 1 - math.clamp(-e / 2.5, 0, 0.9)
+		fade.BackgroundTransparency = 1 - FADE(t)
+		local post = ctx.post
+		if post then
+			cc.Saturation, cc.Contrast, cc.TintColor, cc.Brightness = post.saturation, post.contrast, post.tint, 0
+			bloom.Intensity = post.bloom
+		else
+			cc.Saturation = 0.25
+			cc.Contrast = 0.2
+			cc.Brightness = math.clamp(e * 0.05, -0.15, 0.2)
+			cc.TintColor = (t >= 0.92 and t < 1.0) and Color3.fromRGB(255, 205, 230) or Color3.new(1, 1, 1)
+			bloom.Intensity = BLOOM(t)
+		end
+		-- glitch bars
+		local g = GLITCH(t)
+		for i, b in bars do
+			if g > 0 and Kit.hash(frame, i) > 0.1 then
+				b.Visible = true
+				local y = (Kit.hash(frame, i + 20) + 1) / 2
+				local h = 2 + math.abs(Kit.hash(frame, i + 40)) * g * 0.35
+				b.Position = UDim2.new(Kit.hash(frame, i + 60) * g / 1400, 0, y, 0)
+				b.Size = UDim2.new(1.05, 0, 0, h)
+				local c = math.abs(Kit.hash(frame, i + 80))
+				b.BackgroundColor3 = c > 0.66 and Color3.fromRGB(255, 255, 255) or (c > 0.33 and Color3.fromRGB(90, 170, 255) or Color3.fromRGB(20, 60, 255))
+				b.BackgroundTransparency = 0.15 + c * 0.4
+			else
+				b.Visible = false
+			end
+		end
+	end
+end
+
+return Cinematic
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000002"><Properties><string name="Name">Config</string><ProtectedString name="Source"><![CDATA[--!strict
+-- UltQ configuration. Edit these values in Studio (ReplicatedStorage > UltQShared > Config
+-- is a runtime copy; edit the one inside ServerScriptService > UltQ > Shared).
+
+local Config = {
+	-- Input
+	Key = Enum.KeyCode.Q,              -- keyboard key
+	GamepadKey = Enum.KeyCode.ButtonY, -- controller button
+	MobileButton = true,               -- show an on-screen "ULT" button on touch devices
+
+	-- Timing
+	Duration = 7.7,     -- length of the cinematic (seconds)
+	Cooldown = 12,      -- seconds between casts (enforced on the server)
+	HitTime = 6.4,      -- when the impact lands (seconds after cast)
+
+	-- Gameplay (all optional)
+	LockMovement = true, -- freeze the caster while the ult plays
+	Damage = 0,          -- damage dealt to other Humanoids at HitTime (0 = off)
+	DamageRadius = 25,   -- studs around the caster
+
+	-- Audio: upload ult-blender/ult_sfx.wav to Roblox (Creator Hub > Audio),
+	-- then paste the id here, e.g. "rbxassetid://1234567890". Empty = silent.
+	SoundId = "",
+	Volume = 1,
+
+	-- Optional "exact" mode: upload ult-blender/preview/RobloxUlt_preview.mp4 (or your own 1080p
+	-- Blender render) as a Roblox Video asset and paste its id here. When set, pressing Q plays
+	-- that pre-rendered video full-screen instead of the real-time in-engine cinematic.
+	VideoId = "",
+
+	-- Visual quality: lower this (0.3 - 1) on low-end devices to spawn fewer VFX parts.
+	Density = 1,
+}
+
+return Config
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000003"><Properties><string name="Name">Kit</string><ProtectedString name="Source"><![CDATA[-- Kit: small helpers shared by the cinematic.
+-- All set layouts were designed in Blender (Z-up, character faces -Y). Kit.V / Kit.S / Kit.R
+-- convert Blender coordinates to Roblox (Y-up, character faces -Z) so the numbers match
+-- ult-blender/ult_build.py one-to-one.
+
+local Kit = {}
+
+-- Blender position (x, y, z) -> Roblox Vector3 (-x, z, y)
+function Kit.V(x: number, y: number, z: number): Vector3
+	return Vector3.new(-x, z, y)
+end
+
+-- Blender box size (sx, sy, sz) -> Roblox Size (sx, sz, sy)
+function Kit.S(sx: number, sy: number, sz: number): Vector3
+	return Vector3.new(math.max(sx, 0.05), math.max(sz, 0.05), math.max(sy, 0.05))
+end
+
+-- Blender Euler XYZ (degrees) -> Roblox rotation CFrame
+function Kit.R(a: number?, b: number?, c: number?): CFrame
+	return CFrame.fromAxisAngle(Vector3.yAxis, math.rad(c or 0))
+		* CFrame.fromAxisAngle(Vector3.zAxis, math.rad(b or 0))
+		* CFrame.fromAxisAngle(Vector3.xAxis, -math.rad(a or 0))
+end
+
+function Kit.rgb(r: number, g: number, b: number): Color3
+	return Color3.new(math.clamp(r, 0, 1), math.clamp(g, 0, 1), math.clamp(b, 0, 1))
+end
+
+-- palette (same as the Blender build)
+Kit.BLUE = Kit.rgb(0.05, 0.25, 1)
+Kit.DEEP = Kit.rgb(0.02, 0.06, 0.35)
+Kit.CYAN = Kit.rgb(0.35, 0.65, 1)
+Kit.ICE = Kit.rgb(0.78, 0.9, 1)
+Kit.PINK = Kit.rgb(1, 0.2, 0.5)
+Kit.NAVY = Kit.rgb(0.02, 0.03, 0.08)
+Kit.DARK = Kit.rgb(0.03, 0.05, 0.14)
+Kit.WHITE = Color3.new(1, 1, 1)
+Kit.BLACK = Color3.new(0, 0, 0)
+Kit.ORANGE = Kit.rgb(1, 0.45, 0.1)
+
+export type PartProps = {
+	Size: Vector3?,
+	CFrame: CFrame?,
+	Color: Color3?,
+	Material: Enum.Material?,
+	Transparency: number?,
+	Shape: Enum.PartType?,
+	Name: string?,
+}
+
+function Kit.part(parent: Instance, props: PartProps): Part
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Material = props.Material or Enum.Material.Neon
+	p.Color = props.Color or Kit.WHITE
+	if props.Shape then
+		p.Shape = props.Shape
+	end
+	p.Size = props.Size or Vector3.one
+	p.Transparency = props.Transparency or 0
+	p.CFrame = props.CFrame or CFrame.identity
+	p.Name = props.Name or "FX"
+	p.Parent = parent
+	return p
+end
+
+-- Ball (sphere) part
+function Kit.ball(parent: Instance, cf: CFrame, diameter: number, color: Color3, transparency: number?): Part
+	return Kit.part(parent, {
+		Shape = Enum.PartType.Ball,
+		Size = Vector3.one * math.max(diameter, 0.05),
+		CFrame = cf,
+		Color = color,
+		Transparency = transparency,
+	})
+end
+
+-- Non-uniform ellipsoid (blades, discs)
+function Kit.ellipsoid(parent: Instance, cf: CFrame, size: Vector3, color: Color3): Part
+	local p = Kit.part(parent, { Size = Vector3.one, CFrame = cf, Color = color })
+	local m = Instance.new("SpecialMesh")
+	m.MeshType = Enum.MeshType.Sphere
+	m.Scale = size
+	m.Parent = p
+	return p
+end
+
+-- A thin part spanning from a to b (lightning / ribbon / wisp segments)
+function Kit.segment(parent: Instance, a: Vector3, b: Vector3, thickness: number, color: Color3, transparency: number?): Part
+	local len = (b - a).Magnitude
+	return Kit.part(parent, {
+		Size = Vector3.new(thickness, thickness * 0.35 + 0.05, math.max(len, 0.05)),
+		CFrame = CFrame.lookAt((a + b) / 2, b),
+		Color = color,
+		Transparency = transparency,
+	})
+end
+
+-- Square outline made of 4 bars, lying in the Blender XZ plane (facing the camera along Blender Y).
+-- Returns the 4 parts and their offsets relative to the ring centre (for animation).
+function Kit.squareRing(parent: Instance, size: number, thick: number, color: Color3)
+	local h = size / 2 - thick / 2
+	local defs = {
+		{ Vector3.new(0, h, 0), Vector3.new(size, thick, 0.1) },
+		{ Vector3.new(0, -h, 0), Vector3.new(size, thick, 0.1) },
+		{ Vector3.new(h, 0, 0), Vector3.new(thick, size, 0.1) },
+		{ Vector3.new(-h, 0, 0), Vector3.new(thick, size, 0.1) },
+	}
+	local parts, offsets = {}, {}
+	for _, d in defs do
+		local p = Kit.part(parent, { Size = d[2], Color = color })
+		table.insert(parts, p)
+		table.insert(offsets, CFrame.new(d[1]))
+	end
+	return parts, offsets
+end
+
+-- 4-point star sparkle (two long thin crossed blades + glow ball)
+function Kit.star(parent: Instance, color: Color3)
+	local a = Kit.part(parent, { Size = Vector3.new(0.12, 2, 0.05), Color = color })
+	local b = Kit.part(parent, { Size = Vector3.new(2, 0.12, 0.05), Color = color })
+	local c = Kit.ball(parent, CFrame.identity, 0.35, Kit.WHITE)
+	return { a, b, c }
+end
+
+-- Crescent made of arc segments (outer arc thick in the middle, thin at the tips)
+function Kit.crescent(parent: Instance, radius: number, color: Color3, segments: number?)
+	local n = segments or 20
+	local parts, offsets = {}, {}
+	for i = 0, n - 1 do
+		local f0, f1 = i / n, (i + 1) / n
+		local a0 = math.rad(40 + 280 * f0)
+		local a1 = math.rad(40 + 280 * f1)
+		local mid = (f0 + f1) / 2
+		local thick = radius * 0.45 * math.sin(mid * math.pi) + 0.05
+		local p0 = Vector3.new(math.cos(a0), math.sin(a0), 0) * (radius - thick / 2)
+		local p1 = Vector3.new(math.cos(a1), math.sin(a1), 0) * (radius - thick / 2)
+		local len = (p1 - p0).Magnitude + 0.05
+		local p = Kit.part(parent, { Size = Vector3.new(thick, len, 0.1), Color = color })
+		local up = (p1 - p0).Unit
+		local right = up:Cross(Vector3.zAxis)
+		table.insert(parts, p)
+		table.insert(offsets, CFrame.fromMatrix((p0 + p1) / 2, right, up))
+	end
+	return parts, offsets
+end
+
+-- PointLight on an invisible anchor
+function Kit.light(parent: Instance, cf: CFrame, color: Color3, brightness: number, range: number): PointLight
+	local p = Kit.part(parent, { Size = Vector3.one * 0.1, CFrame = cf, Transparency = 1 })
+	local l = Instance.new("PointLight")
+	l.Color = color
+	l.Brightness = brightness
+	l.Range = math.min(range, 60)
+	l.Shadows = false
+	l.Parent = p
+	return l
+end
+
+------------------------------------------------------------------------- animation ---------
+function Kit.lerp(a: any, b: any, f: number): any
+	local ty = typeof(a)
+	if ty == "number" then
+		return a + (b - a) * f
+	elseif ty == "Vector3" or ty == "CFrame" or ty == "Color3" then
+		return a:Lerp(b, f)
+	end
+	return if f < 1 then a else b
+end
+
+local function smooth(f: number): number
+	return f * f * (3 - 2 * f)
+end
+Kit.smooth = smooth
+
+-- keys = { {time, value, mode?}, ... } sorted by time. mode: "linear" (default), "ease", "const"
+function Kit.track(keys: { any }): (number) -> any
+	return function(t: number): any
+		local first = keys[1]
+		if t <= first[1] then
+			return first[2]
+		end
+		for i = 1, #keys - 1 do
+			local a, b = keys[i], keys[i + 1]
+			if t < b[1] then
+				local mode = a[3]
+				if mode == "const" then
+					return a[2]
+				end
+				local f = (t - a[1]) / math.max(b[1] - a[1], 1e-6)
+				if mode == "ease" then
+					f = smooth(f)
+				end
+				return Kit.lerp(a[2], b[2], f)
+			end
+		end
+		return keys[#keys][2]
+	end
+end
+
+-- 0..1 progress of t through [t0, t1]
+function Kit.prog(t: number, t0: number, t1: number): number
+	return math.clamp((t - t0) / (t1 - t0), 0, 1)
+end
+
+-- deterministic per-frame noise in [-1, 1]
+function Kit.hash(i: number, salt: number): number
+	local x = math.sin(i * 12.9898 + salt * 78.233) * 43758.5453
+	return (x - math.floor(x)) * 2 - 1
+end
+
+return Kit
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000004"><Properties><string name="Name">Rig</string><ProtectedString name="Source"><![CDATA[-- Rig: clones the player's own avatar into a local-only "actor" and poses it by driving the
+-- Motor6D joints directly (no animation asset upload needed). Works with R6 and R15.
+-- Pose data is in Blender degrees (same POSES table as ult-blender/ult_build.py).
+
+local Kit = require(script.Parent.Kit)
+local V, R = Kit.V, Kit.R
+
+local Rig = {}
+
+Rig.POSES = {
+	ready = { torso = { 10, 0, -12 }, head = { -4, 0, 12 }, armL = { -20, 0, 25 }, armR = { -70, 0, -10 }, legL = { -25, 0, 10 }, legR = { 20, 0, -6 }, spear = { 80, 0, 0 } },
+	chest_up = { torso = { 0, 0, 0 }, head = { -3, 0, 0 }, armL = { 0, 0, 8 }, armR = { -25, 0, -10 }, spear = { 150, 0, 0 } },
+	raise = { torso = { -8, 0, 15 }, head = { -10, 0, -5 }, armL = { -40, 0, 30 }, armR = { -160, 0, -15 }, legL = { -10, 0, 0 }, legR = { 10, 0, 0 }, spear = { 170, 0, 0 } },
+	stand_spear = { torso = { 0, 0, 0 }, head = { 0, 0, 0 }, armL = { 0, 0, 6 }, armR = { -30, 0, -8 }, legL = { 0, 0, 3 }, legR = { 0, 0, -3 }, spear = { 120, 0, 0 } },
+	lunge = { torso = { 30, 0, -25 }, head = { -20, 0, 20 }, armL = { 40, 0, 35 }, armR = { -95, 0, -5 }, legL = { -60, 0, 0 }, legR = { 45, 0, 0 }, spear = { 180, 0, 0 } },
+	fly = { torso = { 78, 0, 0 }, head = { -55, 0, 0 }, armL = { 70, 0, 20 }, armR = { -165, 0, -5 }, legL = { 18, 0, 6 }, legR = { 32, 0, -6 }, spear = { 180, 0, 0 } },
+	fly2 = { torso = { 82, 0, 6 }, head = { -60, 0, 0 }, armL = { 80, 0, 30 }, armR = { -172, 0, -10 }, legL = { 25, 0, 8 }, legR = { 10, 0, -8 }, spear = { 182, 0, 0 } },
+	slash = { torso = { 25, 0, 40 }, head = { -15, 0, -30 }, armL = { 60, 0, 40 }, armR = { -80, 0, 80 }, legL = { -50, 0, 0 }, legR = { 55, 0, 0 }, spear = { 150, 0, 0 } },
+	thrust = { torso = { 22, 0, -35 }, head = { -22, 0, 30 }, armL = { 55, 0, 45 }, armR = { -90, 0, 5 }, legL = { -70, 0, 10 }, legR = { 55, 0, -5 }, spear = { 180, 0, 0 } },
+}
+
+local PARTS = { "torso", "head", "armL", "armR", "legL", "legR" }
+local ZERO = { 0, 0, 0 }
+
+-- copy a pose and override some entries
+function Rig.P(name: string, over: { [string]: any }?)
+	local base = Rig.POSES[name]
+	local out = {}
+	for k, v in base do
+		out[k] = v
+	end
+	if over then
+		for k, v in over do
+			out[k] = v
+		end
+	end
+	return out
+end
+
+local JOINTS = {
+	R6 = { torso = "RootJoint", head = "Neck", armL = "Left Shoulder", armR = "Right Shoulder", legL = "Left Hip", legR = "Right Hip" },
+	R15 = { torso = "Root", head = "Neck", armL = "LeftShoulder", armR = "RightShoulder", legL = "LeftHip", legR = "RightHip" },
+}
+
+export type Style = "normal" | "dark" | "silhouette" | "ghost" | "none"
+
+local STYLE = {
+	normal = { fill = Kit.BLUE, fillT = 1, outline = Kit.CYAN, outlineT = 0.35 },
+	dark = { fill = Kit.rgb(0.02, 0.03, 0.09), fillT = 0.05, outline = Kit.rgb(0.55, 0.8, 1), outlineT = 0 },
+	silhouette = { fill = Kit.rgb(0.6, 0.85, 1), fillT = 0, outline = Kit.PINK, outlineT = 0 },
+	ghost = { fill = Kit.rgb(0.12, 0.35, 1), fillT = 0.45, outline = Kit.rgb(0.45, 0.7, 1), outlineT = 0.1 },
+}
+
+local Actor = {}
+Actor.__index = Actor
+
+-- character: the player's character model. stage: CFrame of the set origin.
+function Rig.newActor(character: Model, parent: Instance, stage: CFrame, style: Style?)
+	local old = character.Archivable
+	character.Archivable = true
+	local clone = character:Clone()
+	character.Archivable = old
+	clone.Name = "UltActor"
+
+	for _, d in clone:GetDescendants() do
+		if d:IsA("BaseScript") or d:IsA("ModuleScript") or d:IsA("Sound") or d:IsA("ForceField") then
+			d:Destroy()
+		elseif d:IsA("BasePart") then
+			d.Anchored = false
+			d.CanCollide = false
+			d.CanQuery = false
+			d.CanTouch = false
+			d.Massless = true
+		elseif d:IsA("Motor6D") then
+			d.Transform = CFrame.identity
+		end
+	end
+
+	local hum = clone:FindFirstChildOfClass("Humanoid")
+	if hum then
+		local animator = hum:FindFirstChildOfClass("Animator")
+		if animator then
+			animator:Destroy()
+		end
+		hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+		hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+		hum.PlatformStand = true
+		hum.RequiresNeck = false
+		hum.BreakJointsOnDeath = false
+	end
+
+	local hrp = clone:FindFirstChild("HumanoidRootPart") :: BasePart
+	hrp.Anchored = true
+	hrp.Transparency = 1
+
+	local rigType = (hum and hum.RigType == Enum.HumanoidRigType.R15) and "R15" or "R6"
+	local self = setmetatable({}, Actor)
+	self.model = clone
+	self.hrp = hrp
+	self.stage = stage
+	self.rig = rigType
+	self.keys = {}
+	self.joints = {}
+	for part, jname in JOINTS[rigType] do
+		local j = clone:FindFirstChild(jname, true)
+		if j and j:IsA("Motor6D") then
+			self.joints[part] = j
+		end
+	end
+
+	-- hip height: where the Blender "root" (hip centre) sits relative to the HumanoidRootPart
+	self.hipToRoot = 1
+	local hip = self.joints.legL
+	local root = self.joints.torso
+	if hip and root and hip.Part0 then
+		local part0CF = root.C0 * root.C1:Inverse() -- torso/lower torso relative to HRP
+		local hipPos = (part0CF * hip.C0).Position
+		self.hipToRoot = -hipPos.Y
+	end
+
+	-- spear
+	local handName = rigType == "R15" and "RightHand" or "Right Arm"
+	local hand = clone:FindFirstChild(handName) :: BasePart?
+	if hand then
+		self.spearWeld, self.spearModel = Rig.makeSpear(clone, hand, rigType == "R15" and Vector3.zero or Vector3.new(0, -0.8, 0))
+	end
+
+	self.highlight = Instance.new("Highlight")
+	self.highlight.DepthMode = Enum.HighlightDepthMode.Occluded
+	self.highlight.Adornee = clone
+	self.highlight.Parent = clone
+	self:setStyle(style or "normal")
+
+	clone.Parent = parent
+	return self
+end
+
+function Rig.makeSpear(model: Model, hand: BasePart, grip: Vector3)
+	local folder = Instance.new("Model")
+	folder.Name = "Spear"
+	local root = Kit.part(folder, { Size = Vector3.one * 0.1, Transparency = 1, Name = "SpearRoot" })
+	root.Anchored = false
+	local function piece(p: BasePart, offset: CFrame)
+		p.Anchored = false
+		p.Massless = true
+		local w = Instance.new("Weld")
+		w.Part0 = root
+		w.Part1 = p
+		w.C0 = offset
+		w.Parent = p
+	end
+	-- shaft along +Y (Blender +Z), grip at origin: shaft spans -3 .. 5
+	piece(Kit.part(folder, { Size = Vector3.new(0.14, 8, 0.14), Color = Kit.rgb(0.05, 0.06, 0.1), Material = Enum.Material.Metal }), CFrame.new(0, 1, 0))
+	piece(Kit.part(folder, { Size = Vector3.new(0.06, 6.4, 0.06), Color = Kit.CYAN }), CFrame.new(0, 1.2, -0.07))
+	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.55, 2.6, 0.14), Kit.ICE), CFrame.new(0, 6.2, 0))
+	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.2, 1.2, 0.08), Kit.ICE), CFrame.new(0.35, 5.2, 0) * CFrame.Angles(0, 0, math.rad(-55)))
+	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.2, 1.2, 0.08), Kit.ICE), CFrame.new(-0.35, 5.2, 0) * CFrame.Angles(0, 0, math.rad(55)))
+	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.25, 0.7, 0.25), Kit.ICE), CFrame.new(0, -3.2, 0))
+	local glow = Instance.new("PointLight")
+	glow.Color = Kit.CYAN
+	glow.Range = 10
+	glow.Brightness = 2
+	glow.Parent = root
+
+	local weld = Instance.new("Weld")
+	weld.Part0 = hand
+	weld.Part1 = root
+	weld.C0 = CFrame.new(grip) * R(90, 0, 0)
+	weld.Parent = root
+	weld:SetAttribute("Grip", grip)
+	folder.Parent = model
+	return weld, folder
+end
+
+function Actor:setStyle(style: Style)
+	local s = STYLE[style]
+	local h = self.highlight
+	if not s then
+		h.Enabled = false
+		return
+	end
+	h.Enabled = true
+	h.FillColor = s.fill
+	h.FillTransparency = s.fillT
+	h.OutlineColor = s.outline
+	h.OutlineTransparency = s.outlineT
+	if style == "ghost" then
+		for _, d in self.model:GetDescendants() do
+			if d:IsA("BasePart") and d ~= self.hrp then
+				d.Transparency = math.max(d.Transparency, 0.55)
+				d.Material = Enum.Material.Neon
+				d.Color = Kit.rgb(0.1, 0.3, 1)
+			elseif d:IsA("Decal") then
+				d.Transparency = 0.6
+			end
+		end
+	end
+end
+
+function Actor:setHighlight(fill: Color3, fillT: number, outline: Color3, outlineT: number)
+	local h = self.highlight
+	h.Enabled = true
+	h.FillColor, h.FillTransparency, h.OutlineColor, h.OutlineTransparency = fill, fillT, outline, outlineT
+end
+
+function Actor:scale(s: number)
+	pcall(function()
+		self.model:ScaleTo(s)
+	end)
+	self.scaleFactor = s
+end
+
+-- key a pose. pose = Rig.P(...); loc = Blender hip position (relative to stage); rot = Blender degrees
+function Actor:key(t: number, pose: any, loc: Vector3?, rot: { number }?)
+	table.insert(self.keys, { t = t, pose = pose, loc = loc, rot = rot })
+	table.sort(self.keys, function(a, b)
+		return a.t < b.t
+	end)
+end
+
+local function lerp3(a: { number }, b: { number }, f: number): { number }
+	return { a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, a[3] + (b[3] - a[3]) * f }
+end
+
+-- rotate a joint by R (expressed in Part0's frame) about `pivot` (Part0 space, default = joint)
+local function drive(j: Motor6D, rot: CFrame, pivot: Vector3?)
+	local p = pivot or j.C0.Position
+	local x = CFrame.new(p) * rot * CFrame.new(-p)
+	j.Transform = j.C0:Inverse() * x * j.C0
+end
+
+function Actor:update(t: number)
+	local keys = self.keys
+	if #keys == 0 then
+		return
+	end
+	local a, b, f = keys[1], keys[1], 0
+	if t >= keys[#keys].t then
+		a, b = keys[#keys], keys[#keys]
+	elseif t > keys[1].t then
+		for i = 1, #keys - 1 do
+			if t < keys[i + 1].t then
+				a, b = keys[i], keys[i + 1]
+				f = Kit.smooth((t - a.t) / math.max(b.t - a.t, 1e-6))
+				break
+			end
+		end
+	end
+	local s = self.scaleFactor or 1
+	for _, name in PARTS do
+		local j = self.joints[name]
+		if j then
+			local r = lerp3(a.pose[name] or ZERO, b.pose[name] or ZERO, f)
+			if name == "torso" then
+				drive(j, R(r[1], r[2], r[3]), Vector3.new(0, -self.hipToRoot, 0) + (j.C0.Position * Vector3.new(1, 0, 1)))
+			else
+				drive(j, R(r[1], r[2], r[3]))
+			end
+		end
+	end
+	if self.spearWeld then
+		local sp = lerp3(a.pose.spear or { 90, 0, 0 }, b.pose.spear or { 90, 0, 0 }, f)
+		local grip = self.spearWeld:GetAttribute("Grip") or Vector3.zero
+		self.spearWeld.C0 = CFrame.new(grip * s) * R(sp[1], sp[2], sp[3])
+	end
+	local la, lb = a.loc or Vector3.zero, b.loc or a.loc or Vector3.zero
+	local loc = la:Lerp(lb, f)
+	local rot = lerp3(a.rot or ZERO, b.rot or a.rot or ZERO, f)
+	self.hrp.CFrame = self.stage * CFrame.new(V(loc.X, loc.Y, loc.Z) + Vector3.new(0, self.hipToRoot * s, 0)) * R(rot[1], rot[2], rot[3])
+end
+
+function Actor:destroy()
+	self.model:Destroy()
+end
+
+Rig.Actor = Actor
+return Rig
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000005"><Properties><string name="Name">Shots</string><ProtectedString name="Source"><![CDATA[-- Shots: the 15 shot sets of the ult, ported 1:1 from ult-blender/ult_build.py.
+-- Every set is built from anchored, local-only parts around its own stage origin. All numbers
+-- are in Blender space and converted by Kit.V / Kit.S / Kit.R.
+
+local Kit = require(script.Parent.Kit)
+local Rig = require(script.Parent.Rig)
+local Config = require(script.Parent.Config)
+local V, S, R = Kit.V, Kit.S, Kit.R
+local P = Rig.P
+
+local Shots = {}
+
+-------------------------------------------------------------------------- set context ------
+local Ctx = {}
+Ctx.__index = Ctx
+
+function Shots.newCtx(parent: Instance, stage: CFrame, character: Model, name: string)
+	local folder = Instance.new("Folder")
+	folder.Name = name
+	folder.Parent = parent
+	return setmetatable({
+		folder = folder,
+		stage = stage,
+		char = character,
+		movers = {},
+		updaters = {},
+		actors = {},
+		cams = {},
+		post = nil,
+	}, Ctx)
+end
+
+function Ctx:n(count: number): number
+	return math.max(1, math.floor(count * Config.Density + 0.5))
+end
+
+function Ctx:at(x: number, y: number, z: number, a: number?, b: number?, c: number?): CFrame
+	return self.stage * CFrame.new(V(x, y, z)) * R(a, b, c)
+end
+
+function Ctx:box(size: { number }, pos: { number }, color: Color3, material: Enum.Material?, rot: { number }?, transparency: number?): Part
+	local r = rot or { 0, 0, 0 }
+	return Kit.part(self.folder, {
+		Size = S(size[1], size[2], size[3]),
+		CFrame = self:at(pos[1], pos[2], pos[3], r[1], r[2], r[3]),
+		Color = color,
+		Material = material or Enum.Material.Neon,
+		Transparency = transparency,
+	})
+end
+
+-- flat plate facing the camera (Blender XZ plane), w x h
+function Ctx:plate(w: number, h: number, pos: { number }, color: Color3, transparency: number?, rot: { number }?): Part
+	return self:box({ w, 0.05, h }, pos, color, Enum.Material.Neon, rot, transparency)
+end
+
+function Ctx:ballAt(pos: { number }, d: number, color: Color3, transparency: number?): Part
+	return Kit.ball(self.folder, self:at(pos[1], pos[2], pos[3]), d, color, transparency)
+end
+
+function Ctx:light(pos: { number }, color: Color3, brightness: number, range: number): PointLight
+	return Kit.light(self.folder, self:at(pos[1], pos[2], pos[3]), color, brightness, range)
+end
+
+-- dark box that hides the map / sky around this set
+function Ctx:enclose(center: { number }, size: number)
+	local c = self:at(center[1], center[2], center[3])
+	local h = size / 2
+	local col = Kit.rgb(0.004, 0.006, 0.02)
+	for _, d in { Vector3.xAxis, -Vector3.xAxis, Vector3.yAxis, -Vector3.yAxis, Vector3.zAxis, -Vector3.zAxis } do
+		local s = Vector3.new(math.abs(d.X) > 0 and 2 or size, math.abs(d.Y) > 0 and 2 or size, math.abs(d.Z) > 0 and 2 or size)
+		Kit.part(self.folder, { Size = s, CFrame = c + d * h, Color = col, Material = Enum.Material.SmoothPlastic, Name = "Backdrop" })
+	end
+end
+
+function Ctx:mover(part: BasePart, fn: (number) -> CFrame)
+	table.insert(self.movers, { part, fn })
+end
+
+function Ctx:onUpdate(fn: (number) -> ())
+	table.insert(self.updaters, fn)
+end
+
+function Ctx:actor(style: Rig.Style, spear: boolean?)
+	local a = Rig.newActor(self.char, self.folder, self.stage, style)
+	if spear == false and a.spearModel then
+		a.spearModel:Destroy()
+		a.spearWeld = nil
+	end
+	table.insert(self.actors, a)
+	return a
+end
+
+-- camera: keys = { {t, {pos}, {target}, roll, mode?}, ... }
+function Ctx:camera(name: string, lens: number, keys: { any }, shake: { number }?)
+	local posKeys, tgtKeys, rollKeys = {}, {}, {}
+	for _, k in keys do
+		local m = k[5] or "linear"
+		table.insert(posKeys, { k[1], self.stage * V(k[2][1], k[2][2], k[2][3]), m })
+		table.insert(tgtKeys, { k[1], self.stage * V(k[3][1], k[3][2], k[3][3]), m })
+		table.insert(rollKeys, { k[1], k[4], m })
+	end
+	self.cams[name] = {
+		pos = Kit.track(posKeys),
+		target = Kit.track(tgtKeys),
+		roll = Kit.track(rollKeys),
+		fov = math.deg(2 * math.atan(10.125 / lens)), -- Blender 36mm sensor, 16:9
+		shake = shake, -- {t0, t1, amp, rotAmpDeg, every}
+	}
+end
+
+-- flicker: part only visible during the listed [t0, t1) windows
+function Ctx:flicker(parts: { BasePart }, windows: { { number } }, visibleT: number?)
+	local vt = visibleT or 0
+	self:onUpdate(function(t)
+		local on = false
+		for _, w in windows do
+			if t >= w[1] and t < w[2] then
+				on = true
+				break
+			end
+		end
+		for _, p in parts do
+			p.Transparency = on and vt or 1
+		end
+	end)
+end
+
+function Ctx:update(t: number)
+	for _, a in self.actors do
+		a:update(t)
+	end
+	local list, cfs = table.create(#self.movers), table.create(#self.movers)
+	for i, m in self.movers do
+		list[i] = m[1]
+		cfs[i] = m[2](t)
+	end
+	if #list > 0 then
+		workspace:BulkMoveTo(list, cfs, Enum.BulkMoveMode.FireCFrameChanged)
+	end
+	for _, fn in self.updaters do
+		fn(t)
+	end
+end
+
+function Ctx:destroy()
+	for _, a in self.actors do
+		a:destroy()
+	end
+	self.folder:Destroy()
+end
+
+local function lightningPts(p0: Vector3, p1: Vector3, segs: number, jitter: number, rng: Random): { Vector3 }
+	local d = p1 - p0
+	local side = d:Cross(Vector3.yAxis)
+	if side.Magnitude < 1e-3 then
+		side = d:Cross(Vector3.xAxis)
+	end
+	side = side.Unit
+	local side2 = d:Cross(side).Unit
+	local pts = {}
+	for i = 0, segs do
+		local f = i / segs
+		local j = (i == 0 or i == segs) and 0 or jitter * math.sin(f * math.pi)
+		table.insert(pts, p0 + d * f + side * rng:NextNumber(-j, j) + side2 * rng:NextNumber(-j, j) * 0.5)
+	end
+	return pts
+end
+
+local function chain(ctx, pts: { Vector3 }, thick: number, color: Color3, transparency: number?): { BasePart }
+	local out: { BasePart } = {}
+	for i = 1, #pts - 1 do
+		table.insert(out, Kit.segment(ctx.folder, pts[i], pts[i + 1], thick, color, transparency))
+	end
+	return out
+end
+
+-- group of parts that move/scale/rotate together around a pivot
+local function group(ctx, pivot: (number) -> CFrame, scale: (number) -> number, items: { { any } })
+	-- items: { part, offsetCF, baseSize }
+	ctx:onUpdate(function(t)
+		local pc, s = pivot(t), scale(t)
+		for _, it in items do
+			local p, off, size = it[1], it[2], it[3]
+			p.Size = Vector3.new(math.max(size.X * s, 0.05), math.max(size.Y * s, 0.05), size.Z)
+			p.CFrame = pc * (off.Rotation + off.Position * s)
+		end
+	end)
+end
+
+local function ringItems(parts: { BasePart }, offsets: { CFrame }, extra: CFrame?)
+	local items = {}
+	for i, p in parts do
+		table.insert(items, { p, (extra or CFrame.identity) * offsets[i], p.Size })
+	end
+	return items
+end
+
+--------------------------------------------------------------------------------- SETS -----
+local Sets = {}
+
+-- 0.00 Arena wide shot
+function Sets.S01(ctx)
+	local rng = Random.new(1)
+	ctx:enclose({ 0, 20, 10 }, 200)
+	ctx:box({ 120, 120, 0.4 }, { 0, 20, -0.2 }, Kit.rgb(0.03, 0.045, 0.09), Enum.Material.Metal)
+	local grid = Kit.rgb(0.1, 0.3, 1)
+	for i = -15, 15 do
+		ctx:box({ 0.12, 120, 0.05 }, { i * 4, 20, 0.02 }, grid, nil, nil, 0.35)
+		ctx:box({ 120, 0.12, 0.05 }, { 0, 20 + i * 4, 0.02 }, grid, nil, nil, 0.35)
+	end
+	local wall = Kit.rgb(0.04, 0.07, 0.14)
+	ctx:box({ 120, 2, 40 }, { 0, 46, 20 }, wall, Enum.Material.Metal)
+	for _, side in { -1, 1 } do
+		for k = 0, 6 do
+			local x, h = side * (10 + k * 4.5), 26 - k * 1.5
+			for s = 0, 5 do
+				local a = s / 5
+				ctx:box({ 1.6, 2.2, h / 5 + 0.6 }, { x - side * a * a * 7, 34 - k * 2.5, 2 + a * h }, Kit.rgb(0.06, 0.1, 0.2), Enum.Material.Metal, { 0, side * a * 55, 0 })
+			end
+		end
+		for k = 0, 4 do
+			ctx:box({ 2.6, 0.3, 1.6 }, { side * (16 + k * 6), 44.5, 4 + (k % 2) * 3 }, Kit.ORANGE)
+		end
+	end
+	for _, x in { -5, 5 } do
+		ctx:box({ 1.4, 1.4, 18 }, { x, 38, 9 }, Kit.rgb(0.06, 0.1, 0.2), Enum.Material.Metal)
+	end
+	ctx:box({ 8, 0.3, 12 }, { 0, 44.6, 6 }, Kit.rgb(0.5, 0.75, 1))
+	ctx:box({ 10.5, 1.5, 1.2 }, { 0, 38, 18 }, Kit.rgb(0.06, 0.1, 0.2), Enum.Material.Metal)
+	ctx:box({ 0.25, 22, 0.05 }, { 0.6, -6, 0.03 }, Kit.rgb(0.7, 0.5, 1), nil, { 0, 0, 8 })
+	for _ = 1, ctx:n(80) do
+		local p0 = ctx:at(rng:NextNumber(-30, 30), rng:NextNumber(-4, 40), rng:NextNumber(0.5, 16))
+		local drift = Vector3.new(rng:NextNumber(-0.3, 0.3), rng:NextNumber(0.4, 1.2), 0)
+		local b = Kit.ball(ctx.folder, p0, rng:NextNumber(0.08, 0.25), Kit.rgb(0.3, 0.55, 1))
+		ctx:mover(b, function(t)
+			return p0 + drift * t * 3
+		end)
+	end
+	local av = ctx:actor("normal")
+	av:key(0.0, P("ready"), Vector3.new(0, 8, 2), { 0, 0, -15 })
+	av:key(0.22, P("ready", { torso = { 14, 0, -15 }, armR = { -60, 0, -10 } }), Vector3.new(0, 8, 2), { 0, 0, -15 })
+	ctx:light({ -6, 0, 10 }, Kit.rgb(0.35, 0.55, 1), 3, 40)
+	ctx:light({ 4, 14, 6 }, Kit.rgb(0.45, 0.65, 1), 4, 30)
+	ctx:light({ 1, 4, 0.5 }, Kit.rgb(1, 0.3, 0.7), 3, 10)
+	ctx:camera("S01", 24, {
+		{ 0.0, { 1.5, -14, 3.2 }, { 0, 10, 3.5 }, 0 },
+		{ 0.22, { 1.2, -12.5, 3.0 }, { 0, 10, 3.4 }, 0 },
+	})
+end
+
+-- 0.22 Hologram close-up (+ 0.83 glitch close-up camera)
+function Sets.S02(ctx)
+	local rng = Random.new(2)
+	ctx:enclose({ 0, 0, 2 }, 60)
+	local av = ctx:actor("normal", false)
+	av:key(0.22, P("chest_up", { head = { -6, 0, -8 }, torso = { 0, 0, -10 } }), Vector3.zero)
+	av:key(0.92, P("chest_up", { head = { -2, 0, -14 }, torso = { 0, 0, -14 } }), Vector3.zero)
+	local holo = ctx:actor("ghost", false)
+	holo:key(0.22, P("chest_up", { head = { -6, 0, -8 }, torso = { 0, 0, -10 } }), Vector3.new(0.25, 0.3, 0))
+	local holoT = Kit.track({ { 0.22, 0.9 }, { 0.40, 0.45 }, { 0.67, 0.35 }, { 0.92, 0.8 } })
+	ctx:onUpdate(function(t)
+		holo.highlight.FillTransparency = holoT(t)
+	end)
+	-- data cubes streaming off the body
+	for i = 1, ctx:n(50) do
+		local p0 = Vector3.new(0.5 + rng:NextNumber(-1.6, 1.6), -0.3 + rng:NextNumber(-0.6, 0.6), 2.2 + rng:NextNumber(-1.4, 1.4))
+		local p1 = p0 + Vector3.new(rng:NextNumber(0.8, 2.8), rng:NextNumber(-1.5, 0.2), rng:NextNumber(-0.8, 1.0))
+		local s0 = rng:NextNumber(0.08, 0.3)
+		local wire = i % 3 ~= 0
+		local c = Kit.part(ctx.folder, { Size = Vector3.one * s0, Color = Kit.rgb(0.15, 0.45, 1), Transparency = wire and 0.75 or 0 })
+		if wire then
+			local sb = Instance.new("SelectionBox")
+			sb.Adornee = c
+			sb.Color3 = Kit.rgb(0.4, 0.7, 1)
+			sb.LineThickness = 0.015
+			sb.SurfaceTransparency = 1
+			sb.Parent = c
+		end
+		ctx:onUpdate(function(t)
+			local f = Kit.prog(t, 0.22, 0.92)
+			local p = p0:Lerp(p1, f)
+			c.Size = Vector3.one * math.max(s0 * (1 - f), 0.05)
+			c.CFrame = ctx:at(p.X, p.Y, p.Z)
+		end)
+	end
+	-- lightning arcs (each visible for 2 frames)
+	for k = 0, 8 do
+		local a = ctx:at(1.2, -0.6, 3.4).Position
+		local b = ctx:at(3.2 + rng:NextNumber(0, 1), 0.4, 1.6 + rng:NextNumber(-0.4, 1.4)).Position
+		local bolt = chain(ctx, lightningPts(a, b, 12, 0.35, rng), 0.05, Kit.rgb(0.55, 0.78, 1))
+		local t0 = 0.29 + k * 0.067 + rng:NextNumber(0, 0.03)
+		ctx:flicker(bolt, { { t0, t0 + 0.067 }, { t0 + 0.6, t0 + 0.64 } })
+	end
+	ctx:plate(14, 9, { 1, 4, 2.5 }, Kit.rgb(0.02, 0.07, 0.5), 0.55)
+	ctx:light({ -2.5, -3, 3.5 }, Kit.rgb(0.35, 0.55, 1), 2, 14)
+	ctx:light({ 2.5, 1.5, 3.5 }, Kit.rgb(0.3, 0.6, 1), 4, 10)
+	ctx:camera("S02", 50, {
+		{ 0.22, { 0.55, -4.2, 2.75 }, { 0.05, 0, 2.65 }, -3 },
+		{ 0.67, { 0.45, -3.6, 2.72 }, { 0.05, 0, 2.62 }, -5 },
+	})
+	ctx:camera("S04", 65, {
+		{ 0.83, { 0.1, -3.4, 2.75 }, { 0, 0, 2.7 }, 4 },
+		{ 0.92, { 0.12, -3.2, 2.76 }, { 0, 0, 2.7 }, 5 },
+	}, { 0.83, 0.92, 0.04, 1.0, 1 })
+end
+
+-- 0.67 Ink splash (+ 0.92 pink duotone flash)
+function Sets.S03(ctx)
+	local rng = Random.new(3)
+	ctx:enclose({ 0, 0, 2 }, 60)
+	local av = ctx:actor("silhouette", false)
+	av:key(0.67, P("chest_up", { head = { -10, 0, 10 }, armR = { -40, 0, -30 }, armL = { -30, 0, 30 } }), Vector3.zero)
+	av:key(1.0, P("chest_up", { head = { -14, 0, 14 }, armR = { -50, 0, -35 }, armL = { -40, 0, 35 } }), Vector3.zero)
+	local ink = Kit.rgb(0.02, 0.1, 0.95)
+	local blobs = {}
+	local function blob(center: { number }, spread: { number }, count: number, dmin: number, dmax: number, delay: number)
+		for _ = 1, ctx:n(count) do
+			local p = ctx:at(center[1] + rng:NextNumber(-spread[1], spread[1]), center[2] + rng:NextNumber(0, spread[2]), center[3] + rng:NextNumber(-spread[3], spread[3]))
+			local d = rng:NextNumber(dmin, dmax)
+			local b = Kit.ball(ctx.folder, p, 0.05, ink)
+			local grow = Kit.track({ { 0.67 + delay * rng:NextNumber(0, 1), 0.05 }, { 0.8, d * 0.85, "ease" }, { 1.0, d } })
+			table.insert(blobs, b)
+			ctx:onUpdate(function(t)
+				b.Size = Vector3.one * grow(t)
+			end)
+		end
+	end
+	blob({ 0, 1.6, 2.4 }, { 4.5, 0.6, 3 }, 45, 1.2, 3.2, 0.1)
+	blob({ 1.8, -1.2, 1.0 }, { 2.5, 0.3, 1.2 }, 18, 0.8, 2.0, 0.12)
+	for _ = 1, ctx:n(30) do
+		local from = ctx:at(0, 1, 2.5)
+		local to = ctx:at(rng:NextNumber(-5, 5), rng:NextNumber(0.5, 1.4), rng:NextNumber(0, 5))
+		local b = Kit.ball(ctx.folder, from, rng:NextNumber(0.1, 0.4), ink)
+		table.insert(blobs, b)
+		ctx:mover(b, function(t)
+			return from:Lerp(to, Kit.smooth(Kit.prog(t, 0.67, 0.85)))
+		end)
+	end
+	-- pink duotone frame: figure turns pink, ink stays blue
+	ctx:onUpdate(function(t)
+		if t >= 0.92 then
+			av:setHighlight(Kit.rgb(1, 0.55, 0.78), 0, Kit.PINK, 0)
+		else
+			av:setHighlight(Kit.rgb(0.6, 0.85, 1), 0, Kit.PINK, 0)
+		end
+	end)
+	ctx:camera("S03", 40, {
+		{ 0.67, { 0.2, -5.0, 2.6 }, { 0.2, 0, 2.5 }, 6 },
+		{ 0.83, { 0.2, -4.6, 2.6 }, { 0.2, 0, 2.5 }, 8 },
+	})
+	ctx:camera("S05", 30, {
+		{ 0.92, { 0, -6.2, 2.4 }, { 0, 0, 2.3 }, -4 },
+		{ 1.0, { 0, -6.6, 2.4 }, { 0, 0, 2.3 }, -5 },
+	}, { 0.92, 1.0, 0.08, 1.5, 1 })
+end
+
+-- 1.00 Afterimage clones
+function Sets.S06(ctx)
+	local rng = Random.new(6)
+	ctx:enclose({ 0, 4, 3 }, 60)
+	local av = ctx:actor("normal", false)
+	av:key(1.0, P("chest_up", { head = { -4, 0, 0 } }), Vector3.zero)
+	av:key(1.47, P("chest_up", { head = { -8, 0, 12 }, torso = { 0, 0, 10 } }), Vector3.zero)
+	for _, c in { { -2.3, 1.4, 25, 1.15 }, { 2.4, 1.6, -28, 1.2 }, { -4.2, 3.0, 35, 1.3 }, { 4.4, 3.2, -35, 1.3 } } do
+		local g = ctx:actor("ghost", false)
+		local from = Vector3.new(c[1], c[2], -0.2)
+		local to = from + Vector3.new(c[1] * 0.12, 0.4, 0.15)
+		g:key(1.0, P("chest_up", { head = { -10, 0, c[3] * 0.3 } }), from, { 0, 0, c[3] })
+		g:key(1.47, P("chest_up", { head = { -10, 0, c[3] * 0.3 } }), to, { 0, 0, c[3] })
+	end
+	for gx = -10, 10 do
+		for gz = -1, 11 do
+			if rng:NextNumber() < 0.5 * Config.Density then
+				local solid = rng:NextNumber() < 0.35
+				ctx:plate(0.35, 0.35, { gx * 0.9, 9, gz * 0.9 }, Kit.rgb(0.1, 0.32, 1), solid and 0 or 0.6)
+			end
+		end
+	end
+	for _ = 1, ctx:n(40) do
+		local s = rng:NextNumber(0.08, 0.24)
+		local p0 = ctx:at(rng:NextNumber(-4.5, 4.5), rng:NextNumber(-1.5, 4), rng:NextNumber(2, 6.5))
+		local fall = rng:NextNumber(1.5, 3.5)
+		local b = Kit.part(ctx.folder, { Size = Vector3.one * s, CFrame = p0, Color = Kit.rgb(0.35, 0.6, 1) })
+		ctx:mover(b, function(t)
+			return p0 - Vector3.new(0, fall * Kit.prog(t, 1.0, 1.47), 0)
+		end)
+	end
+	ctx:light({ -3, -4, 4 }, Kit.rgb(0.35, 0.55, 1), 3, 16)
+	ctx:light({ 3, 2, 4.5 }, Kit.rgb(0.5, 0.7, 1), 4, 12)
+	ctx:light({ 0.5, -2, 1 }, Kit.rgb(1, 0.3, 0.6), 1.5, 8)
+	ctx:camera("S06", 32, {
+		{ 1.0, { 0.3, -6.2, 2.0 }, { 0, 0, 2.5 }, 3 },
+		{ 1.47, { 0.2, -5.2, 2.1 }, { 0, 0, 2.55 }, -2 },
+	})
+end
+
+-- 1.47 Rear over-the-shoulder, square tunnel ahead
+function Sets.S07(ctx)
+	ctx:enclose({ 0, 30, 3 }, 140)
+	local av = ctx:actor("normal")
+	av:key(1.47, P("raise", { spear = { 150, 0, 10 } }), Vector3.zero, { 0, 0, 180 })
+	av:key(1.63, P("raise", { armR = { -175, 0, -20 }, spear = { 170, 0, 20 } }), Vector3.zero, { 0, 0, 180 })
+	for i = 0, ctx:n(34) - 1 do
+		local col = (i % 3 == 0) and Kit.rgb(0.4, 0.65, 1) or Kit.rgb(0.03, 0.2, 1)
+		local parts, offs = Kit.squareRing(ctx.folder, 16, 0.35, col)
+		local base = i * 7
+		group(ctx, function(t)
+			return ctx:at(0, 4 + i * 2.2, 3, 0, base + 25 * Kit.prog(t, 1.47, 1.63), 0)
+		end, function()
+			return 1
+		end, ringItems(parts, offs))
+	end
+	ctx:plate(40, 30, { 0, 80, 3 }, Kit.rgb(0.05, 0.2, 1), 0.2)
+	ctx:light({ 0, 6, 5 }, Kit.rgb(0.4, 0.6, 1), 6, 30)
+	ctx:light({ -3, -3, 3 }, Kit.rgb(0.2, 0.3, 1), 2, 12)
+	ctx:camera("S07", 28, {
+		{ 1.47, { 3.4, -6.5, 1.6 }, { -0.3, 8, 3.8 }, -12 },
+		{ 1.63, { 3.0, -5.8, 1.8 }, { -0.3, 8, 3.9 }, -16 },
+	})
+end
+
+-- 1.63 Infinite twisting square tunnel + spear-tip star glints
+function Sets.S08(ctx)
+	ctx:enclose({ 0, 30, 0 }, 140)
+	for i = 0, ctx:n(60) - 1 do
+		local col = (i % 3 == 0) and Kit.rgb(0.4, 0.65, 1) or Kit.rgb(0.03, 0.18, 1)
+		local parts, offs = Kit.squareRing(ctx.folder, 9, 0.22, col)
+		group(ctx, function(t)
+			return ctx:at(0, i * 1.0, 0, 0, i * 6 - 40 * Kit.prog(t, 1.63, 1.97), 0)
+		end, function()
+			return 1
+		end, ringItems(parts, offs))
+	end
+	ctx:plate(12, 12, { 0, 62, 0 }, Kit.rgb(0.4, 0.65, 1), 0.1)
+	local av = ctx:actor("dark")
+	av:scale(0.45)
+	av:key(1.63, P("stand_spear", { spear = { 60, 0, 0 }, armR = { -60, 0, -10 } }), Vector3.new(0, 18, -1.2))
+	av:key(1.97, P("stand_spear", { spear = { 66, 0, 0 }, armR = { -66, 0, -12 }, head = { -12, 0, 0 } }), Vector3.new(0, 18, -1.2))
+	-- huge foreground spear + 4-point star glints
+	local fs = ctx:at(2.0, 2.2, -0.9, 80, 0, -60)
+	Kit.part(ctx.folder, { Size = Vector3.new(0.16, 6, 0.16), CFrame = fs * CFrame.new(0, -3, 0), Color = Kit.rgb(0.03, 0.03, 0.06), Material = Enum.Material.Metal })
+	Kit.ellipsoid(ctx.folder, fs * CFrame.new(0, 0.7, 0), Vector3.new(0.45, 1.6, 0.1), Kit.ICE)
+	for _, st in { { 0.9, 0.5, 1.66 }, { 0.45, 0.32, 1.72 }, { 1.3, 0.25, 1.78 } } do
+		local center = (fs * CFrame.new(0, st[1], 0)).Position + Vector3.new(0, 0, -0.25)
+		local parts = Kit.star(ctx.folder, Kit.rgb(0.75, 0.88, 1))
+		local base = { Vector3.new(0.12, 2, 0.05), Vector3.new(2, 0.12, 0.05), Vector3.one * 0.35 }
+		local sc = Kit.track({ { st[3] - 0.03, 0 }, { st[3] + 0.03, st[2], "ease" }, { 1.97, st[2] * 0.6 } })
+		ctx:onUpdate(function(t)
+			local s = sc(t)
+			for i, p in parts do
+				p.Size = Vector3.new(math.max(base[i].X * s, 0.05), math.max(base[i].Y * s, 0.05), 0.05)
+				p.CFrame = CFrame.new(center)
+				p.Transparency = s < 0.02 and 1 or 0
+			end
+		end)
+	end
+	ctx:light({ 0, 14, 0 }, Kit.rgb(0.4, 0.6, 1), 5, 30)
+	ctx:camera("S08", 30, {
+		{ 1.63, { 0, -2, 0 }, { 0, 20, -0.3 }, 8 },
+		{ 1.97, { 0, 1, 0 }, { 0, 20, -0.3 }, -2 },
+	})
+end
+
+-- 1.97 Diamond portal + crescent, cubes blasting out, lunge
+function Sets.S09(ctx)
+	local rng = Random.new(9)
+	ctx:enclose({ 0, 20, 3 }, 120)
+	local items = {}
+	local frameCol = Kit.rgb(0.55, 0.78, 1)
+	local p1, o1 = Kit.squareRing(ctx.folder, 7, 0.25, frameCol)
+	local p2, o2 = Kit.squareRing(ctx.folder, 7.8, 0.06, frameCol)
+	local diamond = CFrame.Angles(0, 0, math.rad(45))
+	for _, it in ringItems(p1, o1, diamond) do
+		table.insert(items, it)
+	end
+	for _, it in ringItems(p2, o2, diamond) do
+		table.insert(items, it)
+	end
+	local cp, co = Kit.crescent(ctx.folder, 2.0, Kit.rgb(0.85, 0.93, 1))
+	for _, it in ringItems(cp, co, CFrame.Angles(0, 0, math.rad(200)) * CFrame.new(0, 0, -0.05)) do
+		table.insert(items, it)
+	end
+	local inner = Kit.part(ctx.folder, { Size = Vector3.new(6.6, 6.6, 0.05), Color = Kit.rgb(0.15, 0.4, 1), Transparency = 0.55 })
+	table.insert(items, { inner, diamond * CFrame.new(0, 0, 0.3), inner.Size })
+	local sc = Kit.track({ { 1.97, 0.2 }, { 2.10, 1.0, "ease" }, { 2.40, 1.15 } })
+	local rot = Kit.track({ { 1.97, -30, "ease" }, { 2.40, 8 } })
+	group(ctx, function(t)
+		return ctx:at(0, 14, 3, 0, rot(t), 0)
+	end, sc, items)
+	local cols = { Kit.rgb(0.1, 0.35, 1), Kit.rgb(0.03, 0.06, 0.2), Kit.rgb(0.45, 0.72, 1) }
+	for _ = 1, ctx:n(90) do
+		local a = rng:NextNumber(0, 2 * math.pi)
+		local r = rng:NextNumber(4.5, 16)
+		local s = rng:NextNumber(0.15, 0.7)
+		local from = ctx:at(math.cos(a) * 3.2, 14, 3 + math.sin(a) * 3.2)
+		local to = ctx:at(math.cos(a) * r, 14 + rng:NextNumber(-6, 6), 3 + math.sin(a) * r * 0.7)
+		local spin = CFrame.Angles(rng:NextNumber(0, 6), rng:NextNumber(0, 6), rng:NextNumber(0, 6))
+		local st = 1.97 + rng:NextNumber(0, 0.12)
+		local col = cols[rng:NextInteger(1, 3)]
+		local c = Kit.part(ctx.folder, { Size = Vector3.one * s, Color = col, Material = col == cols[2] and Enum.Material.Metal or Enum.Material.Neon })
+		ctx:mover(c, function(t)
+			local f = Kit.prog(t, st, 2.40)
+			return CFrame.new(from.Position:Lerp(to.Position, 1 - (1 - f) ^ 2)) * CFrame.identity:Lerp(spin, f)
+		end)
+	end
+	for _ = 1, ctx:n(40) do
+		local a = rng:NextNumber(0, 2 * math.pi)
+		local r = rng:NextNumber(11, 15)
+		local s = rng:NextNumber(1.5, 4)
+		ctx:box({ s, rng:NextNumber(2, 8), s }, { math.cos(a) * r, rng:NextNumber(10, 45), 3 + math.sin(a) * r }, Kit.rgb(0.03, 0.06, 0.16), Enum.Material.Metal)
+	end
+	local av = ctx:actor("normal")
+	av:key(1.97, P("lunge"), Vector3.new(3.8, 4.5, 0.5), { 0, 0, -120 })
+	av:key(2.40, P("lunge", { torso = { 38, 0, -30 } }), Vector3.new(2.9, 5.5, 0.7), { 0, 0, -120 })
+	ctx:light({ 0, 12, 3 }, Kit.rgb(0.45, 0.65, 1), 8, 40)
+	ctx:light({ 6, 0, 4 }, Kit.rgb(0.35, 0.55, 1), 3, 16)
+	ctx:camera("S09", 26, {
+		{ 1.97, { 5.5, -4.5, 1.5 }, { 0, 14, 3 }, 18 },
+		{ 2.40, { 6.2, -6.5, 1.2 }, { 0, 14, 3 }, 4 },
+	})
+end
+
+-- 2.40 Smirk close-up with swirling energy ribbons
+function Sets.S10(ctx)
+	local rng = Random.new(10)
+	ctx:enclose({ 0, 2, 2.6 }, 40)
+	local av = ctx:actor("normal")
+	av:key(2.40, P("chest_up", { head = { -8, 0, -18 }, torso = { 4, 0, -20 }, armR = { -120, 0, -40 }, spear = { 100, 0, 40 } }), Vector3.zero)
+	av:key(2.72, P("chest_up", { head = { -12, 0, -8 }, torso = { 4, 0, -14 }, armR = { -130, 0, -45 }, spear = { 100, 0, 40 } }), Vector3.zero)
+	local items = {}
+	for k = 1, ctx:n(10) do
+		local r = rng:NextNumber(1.5, 3.2)
+		local a0 = rng:NextNumber(-0.6, math.pi + 0.6)
+		local h = rng:NextNumber(-1.4, 1.3)
+		local dz = rng:NextNumber(-0.03, 0.05)
+		local col = (k % 3 == 0) and Kit.rgb(0.6, 0.85, 1) or Kit.rgb(0.05, 0.3, 1)
+		local th = rng:NextNumber(0.04, 0.1)
+		local prev
+		for j = 0, 14 do
+			local a = a0 + j * 0.16
+			local p = V(math.cos(a) * r, math.abs(math.sin(a)) * r * 0.7 + 0.4, h + j * dz)
+			if prev then
+				local seg = Kit.part(ctx.folder, { Size = Vector3.new(th, th * 0.4, (p - prev).Magnitude + 0.05), Color = col })
+				table.insert(items, { seg, CFrame.lookAt((p + prev) / 2, p), seg.Size })
+			end
+			prev = p
+		end
+	end
+	local spin = Kit.track({ { 2.40, 0 }, { 2.72, -140 } })
+	group(ctx, function(t)
+		return ctx:at(0, 0, 2.6, 11, 0, spin(t))
+	end, function()
+		return 1
+	end, items)
+	ctx:plate(16, 10, { 0, 6, 2.6 }, Kit.rgb(0.02, 0.1, 0.8), 0.45)
+	local moon = Kit.part(ctx.folder, { Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.2, 3.2, 3.2), Color = Kit.rgb(0.55, 0.75, 1) })
+	moon.CFrame = ctx:at(-2.4, 5, 3.4) * CFrame.Angles(0, math.rad(90), 0)
+	ctx:light({ 2, -3, 3.5 }, Kit.rgb(0.5, 0.7, 1), 3, 12)
+	ctx:light({ -2.2, 1.5, 3.4 }, Kit.rgb(0.4, 0.6, 1), 4, 10)
+	ctx:camera("S10", 38, {
+		{ 2.40, { 0.9, -4.0, 2.55 }, { 0, 0, 2.6 }, 6 },
+		{ 2.72, { 0.6, -3.4, 2.6 }, { 0, 0, 2.65 }, 2 },
+	})
+end
+
+-- 2.72 Dash through a cube field
+function Sets.S11(ctx)
+	local rng = Random.new(11)
+	ctx:enclose({ 0, 40, 2 }, 140)
+	local cols = { Kit.rgb(0.03, 0.06, 0.16), Kit.rgb(0.1, 0.35, 1), Kit.ICE }
+	for _ = 1, ctx:n(150) do
+		local s = rng:NextNumber(0.3, 1.6)
+		local roll = rng:NextNumber()
+		local col = roll < 0.6 and cols[1] or (roll < 0.9 and cols[2] or cols[3])
+		ctx:box({ s, s, s }, { rng:NextNumber(-9, 9), 40 + rng:NextNumber(-40, 40), 2 + rng:NextNumber(-6, 6) }, col, col == cols[1] and Enum.Material.Metal or Enum.Material.Neon, { rng:NextNumber(0, 90), rng:NextNumber(0, 90), rng:NextNumber(0, 90) })
+	end
+	local av = ctx:actor("dark")
+	av:key(2.72, P("fly"), Vector3.new(0.3, 10, 1.8), { 0, 0, 180 })
+	av:key(2.83, P("fly"), Vector3.new(0, 34, 2.2), { 0, 0, 180 })
+	ctx:light({ 0, 30, 2 }, Kit.rgb(0.4, 0.6, 1), 6, 60)
+	ctx:camera("S11", 20, {
+		{ 2.72, { 0, 0, 2 }, { 0, 40, 2 }, 0 },
+		{ 2.83, { 0, 24, 2.3 }, { 0, 64, 2.3 }, 12 },
+	})
+end
+
+-- 2.83 White-blue flash explosion with radial rays
+function Sets.S12(ctx)
+	local rng = Random.new(12)
+	ctx:enclose({ 0, 10, 0 }, 120)
+	local core = ctx:ballAt({ 0, 10, 0 }, 1, Kit.ICE)
+	local cs = Kit.track({ { 2.83, 0.8 }, { 2.92, 7, "ease" }, { 3.0, 4 } })
+	ctx:onUpdate(function(t)
+		core.Size = Vector3.one * cs(t)
+	end)
+	local items = {}
+	for k = 1, ctx:n(36) do
+		local a = rng:NextNumber(0, 360)
+		local ln = rng:NextNumber(8, 26)
+		local w = rng:NextNumber(0.06, 0.3)
+		local st = rng:NextNumber(0.5, 3)
+		local ray = Kit.part(ctx.folder, { Size = Vector3.new(w, ln, 0.05), Color = (k % 2 == 0) and Kit.rgb(0.45, 0.72, 1) or Kit.rgb(0.05, 0.3, 1), Transparency = 0.1 })
+		table.insert(items, { ray, CFrame.Angles(0, 0, math.rad(a)) * CFrame.new(0, st + ln / 2, rng:NextNumber(-1, 1)), ray.Size })
+	end
+	local rs = Kit.track({ { 2.83, 0.3 }, { 2.95, 1.2, "ease" } })
+	local rr = Kit.track({ { 2.83, 0 }, { 3.0, 18 } })
+	group(ctx, function(t)
+		return ctx:at(0, 10, 0, 0, rr(t), 0)
+	end, rs, items)
+	ctx:plate(80, 50, { 0, 30, 0 }, Kit.rgb(0.03, 0.2, 1), 0)
+	for _ = 1, ctx:n(30) do
+		local s = rng:NextNumber(0.15, 0.6)
+		ctx:box({ s, s, s }, { rng:NextNumber(-7, 7), 8 + rng:NextNumber(-3, 3), rng:NextNumber(-4, 4) }, Kit.ICE, nil, { rng:NextNumber(0, 90), rng:NextNumber(0, 90), 0 })
+	end
+	ctx:camera("S12", 24, {
+		{ 2.83, { 0, -6, 0 }, { 0, 10, 0 }, 0 },
+		{ 3.0, { 0, -3, 0 }, { 0, 10, 0 }, -6 },
+	}, { 2.83, 3.0, 0.15, 2, 1 })
+end
+
+-- 3.00 Hyperspace streaks
+function Sets.S13(ctx)
+	local rng = Random.new(13)
+	ctx:enclose({ 0, 70, 0 }, 380)
+	local cols = { Kit.rgb(0.03, 0.08, 0.3), Kit.rgb(0.1, 0.35, 1), Kit.rgb(0.6, 0.8, 1), Kit.rgb(0.05, 0.15, 0.6) }
+	for _ = 1, ctx:n(120) do
+		local a = rng:NextNumber(0, 2 * math.pi)
+		local r = rng:NextNumber(1.6, 14)
+		local ln = rng:NextNumber(6, 40)
+		local th = rng:NextNumber(0.15, 1.6) * (r / 8 + 0.3)
+		local y0 = rng:NextNumber(0, 160)
+		local dy = rng:NextNumber(70, 110)
+		local roll = rng:NextNumber()
+		local col = roll < 0.55 and cols[1] or cols[rng:NextInteger(2, 4)]
+		local b = ctx:box({ th, ln, th * rng:NextNumber(0.3, 1) }, { math.cos(a) * r, y0, math.sin(a) * r }, col, roll < 0.55 and Enum.Material.Metal or Enum.Material.Neon, { 0, -math.deg(a), 0 })
+		local cf0 = b.CFrame
+		local off = V(0, -dy, 0)
+		ctx:mover(b, function(t)
+			return cf0 + off * Kit.prog(t, 3.0, 3.47)
+		end)
+	end
+	local star = Kit.star(ctx.folder, Kit.WHITE)
+	local base = { Vector3.new(0.12, 2, 0.05), Vector3.new(2, 0.12, 0.05), Vector3.one * 0.35 }
+	local ss = Kit.track({ { 3.0, 2 }, { 3.1, 6 }, { 3.2, 3 }, { 3.3, 7 }, { 3.4, 4 }, { 3.47, 8 } })
+	local sp = ctx:at(0, 60, 0)
+	ctx:onUpdate(function(t)
+		local s = ss(t)
+		for i, p in star do
+			p.Size = Vector3.new(math.max(base[i].X * s, 0.05), math.max(base[i].Y * s, 0.05), 0.05)
+			p.CFrame = sp
+		end
+	end)
+	ctx:ballAt({ 0, 70, 0 }, 6, Kit.rgb(0.7, 0.85, 1))
+	ctx:plate(200, 200, { 0, 160, 0 }, Kit.rgb(0.0, 0.04, 0.3), 0)
+	ctx:camera("S13", 22, {
+		{ 3.0, { 0, -4, 0 }, { 0, 60, 0 }, 0 },
+		{ 3.47, { 0, 4, 0 }, { 0, 60, 0 }, 25 },
+	})
+end
+
+-- 3.47 Crescent flare, fade to dark
+function Sets.S14(ctx)
+	local rng = Random.new(14)
+	ctx:enclose({ 0, 20, 0 }, 100)
+	local cp, co = Kit.crescent(ctx.folder, 1.0, Kit.WHITE)
+	local items = ringItems(cp, co, CFrame.Angles(0, 0, math.rad(90)))
+	local sc = Kit.track({ { 3.47, 0.4 }, { 3.52, 1.3, "ease" }, { 3.62, 0.1 } })
+	group(ctx, function()
+		return ctx:at(0, 20, 0)
+	end, sc, items)
+	local rays = {}
+	for _ = 1, ctx:n(30) do
+		local ln = rng:NextNumber(10, 30)
+		local ray = Kit.part(ctx.folder, { Size = Vector3.new(rng:NextNumber(0.05, 0.35), ln, 0.05), Color = Kit.rgb(0.1, 0.35, 1), Transparency = 0.2 })
+		table.insert(rays, { ray, CFrame.Angles(0, 0, math.rad(rng:NextNumber(0, 360))) * CFrame.new(0, ln / 2, 0.5), ray.Size })
+	end
+	local rs = Kit.track({ { 3.47, 1 }, { 3.62, 0.3 } })
+	local rr = Kit.track({ { 3.47, 0 }, { 3.62, -25 } })
+	group(ctx, function(t)
+		return ctx:at(0, 20, 0, 0, rr(t), 0)
+	end, rs, rays)
+	ctx:camera("S14", 30, {
+		{ 3.47, { 0, 0, 0 }, { 0, 20, 0 }, 0 },
+		{ 3.62, { 0, 2, 0 }, { 0, 20, 0 }, 8 },
+	})
+end
+
+-- 3.62 Flight through the block tunnel toward the glowing core
+function Sets.S15(ctx)
+	local rng = Random.new(15)
+	ctx:enclose({ 0, 70, 0 }, 400)
+	local wallCols = { Kit.rgb(0.02, 0.035, 0.1), Kit.rgb(0.03, 0.06, 0.16), Kit.rgb(0.02, 0.05, 0.13) }
+	local Rr = 9
+	for _ = 1, ctx:n(350) do
+		local y = rng:NextNumber(-10, 150)
+		local side = rng:NextInteger(0, 3)
+		local u = rng:NextNumber(-Rr, Rr)
+		local inset = rng:NextNumber(0, 1.6)
+		local sz = { rng:NextNumber(1, 3), rng:NextNumber(1, 5), rng:NextNumber(1, 3) }
+		local p
+		if side == 0 then
+			p = { u, y, -Rr + inset }
+		elseif side == 1 then
+			p = { u, y, Rr - inset }
+		elseif side == 2 then
+			p = { -Rr + inset, y, u }
+		else
+			p = { Rr - inset, y, u }
+		end
+		if rng:NextNumber() < 0.07 then
+			ctx:box(sz, p, Kit.rgb(0.05, 0.25, 1))
+		else
+			ctx:box(sz, p, wallCols[rng:NextInteger(1, 3)], Enum.Material.Metal)
+		end
+	end
+	ctx:ballAt({ 0, 120, 0 }, 10, Kit.ICE)
+	ctx:ballAt({ 0, 120, 0 }, 22, Kit.rgb(0.1, 0.35, 1), 0.7)
+	ctx:plate(60, 60, { 0, 135, 0 }, Kit.rgb(0.05, 0.3, 1), 0)
+	local dp, doff = Kit.squareRing(ctx.folder, 22, 0.6, Kit.rgb(0.6, 0.8, 1))
+	local drot = Kit.track({ { 3.62, 45 }, { 6.0, 110 } })
+	group(ctx, function(t)
+		return ctx:at(0, 112, 0, 0, drot(t), 0)
+	end, function()
+		return 1
+	end, ringItems(dp, doff))
+	-- shards around the core
+	for _ = 1, ctx:n(50) do
+		local a = rng:NextNumber(0, 2 * math.pi)
+		local r = rng:NextNumber(5, 12)
+		local s = rng:NextNumber(0.3, 1.4)
+		local glow = rng:NextNumber() < 0.5
+		local c = Kit.part(ctx.folder, { Size = Vector3.one * s, Color = glow and Kit.ICE or Kit.rgb(0.03, 0.05, 0.16), Material = glow and Enum.Material.Neon or Enum.Material.Metal })
+		local pos = ctx:at(math.cos(a) * r, 120 + rng:NextNumber(-6, 4), math.sin(a) * r).Position
+		local rx, ry = rng:NextNumber(0, 6), rng:NextNumber(0, 6)
+		ctx:mover(c, function(t)
+			local f = Kit.prog(t, 3.62, 6.0)
+			return CFrame.new(pos) * CFrame.Angles(rx + 3 * f, ry + 2 * f, 0)
+		end)
+	end
+	-- floating debris along the path
+	for _ = 1, ctx:n(80) do
+		local p0 = ctx:at(rng:NextNumber(-7, 7), rng:NextNumber(0, 110), rng:NextNumber(-7, 7)).Position
+		local d = V(rng:NextNumber(-1, 1), rng:NextNumber(-3, 0), rng:NextNumber(-1, 1))
+		local s = rng:NextNumber(0.1, 0.5)
+		local glow = rng:NextNumber() < 0.3
+		local c = Kit.part(ctx.folder, { Size = Vector3.one * s, Color = glow and Kit.rgb(0.3, 0.55, 1) or Kit.rgb(0.03, 0.04, 0.1), Material = glow and Enum.Material.Neon or Enum.Material.Metal })
+		local rx = rng:NextNumber(0, 6)
+		ctx:mover(c, function(t)
+			local f = Kit.prog(t, 3.62, 6.0)
+			return CFrame.new(p0 + d * f) * CFrame.Angles(rx * f, rx, 0)
+		end)
+	end
+	-- energy wisps swirling around the flight path
+	local items = {}
+	for k = 1, ctx:n(24) do
+		local y0 = rng:NextNumber(15, 110)
+		local r = rng:NextNumber(3.8, 5.6)
+		local a0 = rng:NextNumber(0, 2 * math.pi)
+		local col = (k % 3 == 0) and Kit.rgb(0.4, 0.65, 1) or Kit.rgb(0.05, 0.25, 1)
+		local th = rng:NextNumber(0.06, 0.25)
+		local prev
+		for j = 0, 12 do
+			local a = a0 + j * 0.3
+			local p = V(math.cos(a) * r, y0 + j * rng:NextNumber(0.5, 1.1), math.sin(a) * r + math.sin(j * 0.5) * 0.4)
+			if prev then
+				local seg = Kit.part(ctx.folder, { Size = Vector3.new(th, th * 0.4, (p - prev).Magnitude + 0.05), Color = col, Transparency = 0.15 })
+				table.insert(items, { seg, CFrame.lookAt((p + prev) / 2, p), seg.Size })
+			end
+			prev = p
+		end
+	end
+	local swirl = Kit.track({ { 3.62, 0 }, { 6.0, -220 } })
+	group(ctx, function(t)
+		return ctx:at(0, 0, 0, 0, swirl(t), 0)
+	end, function()
+		return 1
+	end, items)
+	-- the flyer
+	local av = ctx:actor("dark")
+	local path = {
+		{ 3.62, Vector3.new(-1.5, 8, -1), "fly", { 0, 0, 180 } },
+		{ 4.4, Vector3.new(-0.5, 34, -0.2), "fly2", { 0, 14, 180 } },
+		{ 5.2, Vector3.new(0.4, 60, 0.4), "fly", { 0, -10, 175 } },
+		{ 6.0, Vector3.new(0, 86, 0), "fly2", { 0, 6, 182 } },
+	}
+	for _, k in path do
+		av:key(k[1], P(k[3]), k[2], k[4])
+	end
+	local torso = av.model:FindFirstChild("Torso") or av.model:FindFirstChild("UpperTorso")
+	if torso and torso:IsA("BasePart") then
+		for _, off in { { -0.6, 0 }, { 0.6, 0 }, { 0, 0.8 } } do
+			local tr = Kit.part(ctx.folder, { Size = Vector3.new(0.1, 7, 0.05), Color = Kit.rgb(0.15, 0.4, 1), Transparency = 0.25 })
+			ctx:mover(tr, function()
+				return torso.CFrame * CFrame.new(off[1], -4 + off[2], 0.3)
+			end)
+		end
+	end
+	for k = 0, 6 do
+		ctx:light({ rng:NextNumber(-3, 3), 8 + k * 15, rng:NextNumber(-3, 3) }, Kit.rgb(0.1, 0.3, 1), 3, 50)
+	end
+	ctx:light({ 0, 110, 0 }, Kit.rgb(0.45, 0.65, 1), 10, 60)
+	-- follow-cam locked to the flight path
+	local keys = { { 3.62, { -4.0, -4, 2.2 }, { 0, 40, -0.5 }, -10, "ease" } }
+	local offs = { { -3.4, -7, 1.6 }, { -3.0, -7.5, 1.2 }, { -2.6, -8, 1.0 } }
+	local looks = { { 1.5, 25, -0.5 }, { 1.0, 28, -0.4 }, { 0.0, 34, 0.0 } }
+	local rolls = { -8, 6, 14 }
+	for i = 2, 4 do
+		local pos = path[i][2]
+		local o, l = offs[i - 1], looks[i - 1]
+		table.insert(keys, { path[i][1], { pos.X + o[1], pos.Y + o[2], pos.Z + o[3] }, { pos.X + l[1], pos.Y + l[2], pos.Z + l[3] }, rolls[i - 1], "ease" })
+	end
+	ctx:camera("S15", 26, keys, { 3.62, 6.0, 0.06, 0.6, 2 })
+end
+
+-- 6.00 Final slash
+function Sets.S16(ctx)
+	local rng = Random.new(16)
+	ctx:enclose({ 0, 10, 0 }, 120)
+	for _ = 1, ctx:n(30) do
+		ctx:box({ rng:NextNumber(2, 6), rng:NextNumber(2, 6), rng:NextNumber(2, 10) }, { rng:NextNumber(-20, 20), rng:NextNumber(10, 30), rng:NextNumber(-8, 10) }, Kit.rgb(0.05, 0.1, 0.25), Enum.Material.Metal)
+		ctx:box({ 0.1, 0.1, rng:NextNumber(2, 8) }, { rng:NextNumber(-20, 20), rng:NextNumber(9, 20), rng:NextNumber(-8, 10) }, Kit.rgb(0.3, 0.55, 1))
+	end
+	local vline = ctx:box({ 0.12, 0.05, 40 }, { 0.5, 4, 0 }, Kit.rgb(1, 0.6, 0.9), nil, { 0, -12, 0 })
+	local vglow = ctx:box({ 1.2, 0.05, 40 }, { 0.5, 4.1, 0 }, Kit.PINK, nil, { 0, -12, 0 }, 0.55)
+	local vh = Kit.track({ { 6.0, 0 }, { 6.06, 1, "ease" }, { 6.4, 1 } })
+	local vw = Kit.track({ { 6.0, 1 }, { 6.06, 1 }, { 6.4, 2.5 } })
+	local vcf, gcf = vline.CFrame, vglow.CFrame
+	ctx:onUpdate(function(t)
+		local h, w = vh(t), vw(t)
+		vline.Size = Vector3.new(0.12 * w, math.max(40 * h, 0.05), 0.05)
+		vglow.Size = Vector3.new(1.2 * w, math.max(40 * h, 0.05), 0.05)
+		vline.CFrame, vglow.CFrame = vcf, gcf
+		vline.Transparency = h < 0.01 and 1 or 0
+		vglow.Transparency = h < 0.01 and 1 or 0.55
+	end)
+	local beamCF = ctx:at(0, 6, -0.6, 0, 0, -8)
+	local beam = Kit.part(ctx.folder, { Shape = Enum.PartType.Cylinder, Size = Vector3.new(1, 1, 1), CFrame = beamCF, Color = Kit.ICE })
+	local halo = Kit.part(ctx.folder, { Shape = Enum.PartType.Cylinder, Size = Vector3.new(1, 1, 1), CFrame = beamCF, Color = Kit.rgb(0.05, 0.3, 1), Transparency = 0.55 })
+	for _, b in { { beam, 0.45 }, { halo, 1.3 } } do
+		local w = Kit.track({ { 6.05, 0 }, { 6.15, b[2] * 2, "ease" }, { 6.4, b[2] * 3.6 } })
+		local l = Kit.track({ { 6.05, 0 }, { 6.15, 70, "ease" }, { 6.4, 80 } })
+		ctx:onUpdate(function(t)
+			local d = w(t)
+			b[1].Size = Vector3.new(math.max(l(t), 0.05), math.max(d, 0.05), math.max(d, 0.05))
+			b[1].CFrame = beamCF
+			b[1].Transparency = d < 0.01 and 1 or (b[1] == beam and 0 or 0.55)
+		end)
+	end
+	for _ = 1, ctx:n(60) do
+		local from = ctx:at(0.5, 5, 0).Position
+		local to = ctx:at(rng:NextNumber(-12, 12), rng:NextNumber(0, 14), rng:NextNumber(-8, 8)).Position
+		local glow = rng:NextNumber() < 0.5
+		local c = Kit.part(ctx.folder, { Size = Vector3.one * rng:NextNumber(0.1, 0.6), Color = glow and Kit.ICE or Kit.rgb(0.03, 0.04, 0.1), Material = glow and Enum.Material.Neon or Enum.Material.Metal, Transparency = 1 })
+		local spin = rng:NextNumber(0, 6)
+		ctx:onUpdate(function(t)
+			local f = Kit.prog(t, 6.05, 6.4)
+			c.Transparency = t < 6.05 and 1 or 0
+			c.CFrame = CFrame.new(from:Lerp(to, 1 - (1 - f) ^ 2)) * CFrame.Angles(spin * f, spin, 0)
+		end)
+	end
+	local av = ctx:actor("dark")
+	av:key(6.0, P("slash"), Vector3.new(-7, 3, -1), { 0, 0, -100 })
+	av:key(6.12, P("slash", { armR = { -80, 0, -60 } }), Vector3.new(4, 4, -0.5), { 0, 0, -90 })
+	av:key(6.4, P("slash", { armR = { -70, 0, -80 } }), Vector3.new(7, 5, -0.3), { 0, 0, -85 })
+	ctx:light({ 0.5, 3, 0 }, Kit.rgb(0.6, 0.75, 1), 8, 30)
+	ctx:light({ 0.5, 2, 2 }, Kit.rgb(1, 0.4, 0.8), 5, 20)
+	ctx:camera("S16", 22, {
+		{ 6.0, { -1.5, -9, 0.5 }, { 0.5, 6, 0 }, 14 },
+		{ 6.4, { -0.5, -6, 0.2 }, { 0.5, 6, 0 }, 22 },
+	}, { 6.05, 6.4, 0.25, 3, 1 })
+end
+
+-- 6.40 IMPACT FRAMES finale
+local IMPACT_SEQ = { -- {time, invert, red}
+	{ 6.40, 1, 0 }, { 6.4667, 0, 0 }, { 6.5333, 1, 0 }, { 6.60, 0, 1 }, { 6.6667, 1, 0 },
+	{ 6.7333, 0, 0 }, { 6.80, 1, 0 }, { 6.8667, 0, 1 }, { 6.9333, 0, 0 },
+}
+Shots.IMPACT_END = 7.20
+
+function Sets.S17(ctx)
+	local rng = Random.new(17)
+	ctx:enclose({ 0, 10, 2 }, 120)
+	local av = ctx:actor("dark")
+	av:key(6.40, P("thrust", { armR = { -90, 0, 10 } }), Vector3.new(0, 6, 0.4), { 0, 0, -20 })
+	av:key(6.80, P("thrust", { armR = { -92, 0, 12 }, torso = { 26, 0, -38 } }), Vector3.new(0, 6, 0.4), { 0, 0, -20 })
+	av:key(7.70, P("thrust", { armR = { -94, 0, 14 }, torso = { 28, 0, -40 } }), Vector3.new(0, 6, 0.4), { 0, 0, -20 })
+	local bg = ctx:plate(80, 50, { 0, 30, 2 }, Kit.WHITE, 0)
+	local dark, light = {}, {}
+	local items = {}
+	for k = 1, ctx:n(50) do
+		local ln = rng:NextNumber(8, 30)
+		local w = rng:NextNumber(0.08, 0.7)
+		local st = rng:NextNumber(1.5, 4)
+		local p = Kit.part(ctx.folder, { Size = Vector3.new(w, ln, 0.05), Material = Enum.Material.SmoothPlastic })
+		table.insert(k % 3 == 0 and light or dark, p)
+		table.insert(items, { p, CFrame.Angles(0, 0, math.rad(rng:NextNumber(0, 360))) * CFrame.new(0, st + ln / 2, rng:NextNumber(0.5, 6)), p.Size })
+	end
+	local bs = Kit.track({ { 6.40, 0.6 }, { 6.55, 1.1, "ease" }, { 7.70, 1.3 } })
+	local br = Kit.track({ { 6.40, 0 }, { 7.70, 30 } })
+	group(ctx, function(t)
+		return ctx:at(0.6, 3.5, 2.0, 0, br(t), 0)
+	end, bs, items)
+	-- shockwave ring
+	local ring = {}
+	local ringItemsList = {}
+	for i = 0, 31 do
+		local a0, a1 = i / 32 * 2 * math.pi, (i + 1) / 32 * 2 * math.pi
+		local p0 = Vector3.new(math.cos(a0), math.sin(a0), 0)
+		local p1 = Vector3.new(math.cos(a1), math.sin(a1), 0)
+		local seg = Kit.part(ctx.folder, { Size = Vector3.new(0.07, (p1 - p0).Magnitude + 0.01, 0.05) })
+		local up = (p1 - p0).Unit
+		table.insert(ring, seg)
+		table.insert(ringItemsList, { seg, CFrame.fromMatrix((p0 + p1) / 2, up:Cross(Vector3.zAxis), up), seg.Size })
+	end
+	group(ctx, function()
+		return ctx:at(0.6, 4.5, 2.2)
+	end, Kit.track({ { 6.40, 0.2 }, { 6.9, 9, "ease" }, { 7.7, 14 } }), ringItemsList)
+	local core = ctx:ballAt({ 0.2, 0.2, 2.3 }, 0.3, Kit.WHITE)
+	local cs = Kit.track({ { 6.40, 0.3 }, { 6.5, 0.9, "ease" }, { 7.2, 0.6 }, { 7.35, 2.4 }, { 7.7, 4 } })
+	local debris = {}
+	for _ = 1, ctx:n(40) do
+		local s = rng:NextNumber(0.1, 0.6)
+		table.insert(debris, ctx:box({ s, s, s }, { rng:NextNumber(-10, 10), 6 + rng:NextNumber(-6, 6), 2 + rng:NextNumber(-7, 7) }, Kit.WHITE, Enum.Material.SmoothPlastic, { rng:NextNumber(0, 90), rng:NextNumber(0, 90), 0 }))
+	end
+	local function paint(list: { BasePart }, col: Color3, neon: boolean)
+		for _, p in list do
+			p.Color = col
+			p.Material = neon and Enum.Material.Neon or Enum.Material.SmoothPlastic
+		end
+	end
+	local W, B = Kit.WHITE, Kit.BLACK
+	ctx:onUpdate(function(t)
+		core.Size = Vector3.one * cs(t)
+		if t >= 6.40 and t < Shots.IMPACT_END then
+			local inv, red = 0, 0
+			for _, s in IMPACT_SEQ do
+				if t >= s[1] then
+					inv, red = s[2], s[3]
+				end
+			end
+			local fg, bgc = (inv == 1) and W or B, (inv == 1) and B or W
+			-- inv 0: white world, black silhouette with white outline. inv 1: the inverse.
+			paint({ bg }, bgc, inv == 0)
+			paint(dark, fg, inv == 1)
+			paint(light, bgc, inv == 0)
+			paint(ring, bgc, inv == 0)
+			paint(debris, fg, inv == 1)
+			paint({ core }, bgc, inv == 0)
+			av:setHighlight(fg, 0, bgc, 0)
+			ctx.post = { saturation = -1, contrast = 0.8, tint = red == 1 and Kit.rgb(1, 0.18, 0.3) or W, bloom = 0 }
+		else
+			paint({ bg }, Kit.rgb(0.02, 0.15, 1), true)
+			paint(dark, Kit.rgb(0.02, 0.03, 0.1), false)
+			paint(light, Kit.ICE, true)
+			paint(ring, Kit.ICE, true)
+			paint(debris, Kit.rgb(0.03, 0.05, 0.14), false)
+			paint({ core }, Kit.ICE, true)
+			av:setStyle("dark")
+			ctx.post = nil
+		end
+	end)
+	ctx:light({ 1, 2, 3 }, Kit.rgb(0.6, 0.75, 1), 6, 20)
+	ctx:light({ -2, 10, 5 }, Kit.rgb(0.3, 0.5, 1), 6, 30)
+	ctx:camera("S17", 26, {
+		{ 6.40, { 1.6, -3.5, 1.4 }, { 0, 6, 2.3 }, -14 },
+		{ 6.80, { 1.4, -4.3, 1.3 }, { 0, 6, 2.3 }, -10 },
+		{ 7.70, { 1.2, -5.2, 1.2 }, { 0, 6, 2.3 }, -6 },
+	}, { 6.40, 6.85, 0.22, 3.5, 1 })
+end
+
+Shots.Sets = Sets
+
+-- shot list: {camera name, start, end, set builder name}
+Shots.LIST = {
+	{ "S01", 0.00, 0.22, "S01" },
+	{ "S02", 0.22, 0.67, "S02" },
+	{ "S03", 0.67, 0.83, "S03" },
+	{ "S04", 0.83, 0.92, "S02" },
+	{ "S05", 0.92, 1.00, "S03" },
+	{ "S06", 1.00, 1.47, "S06" },
+	{ "S07", 1.47, 1.63, "S07" },
+	{ "S08", 1.63, 1.97, "S08" },
+	{ "S09", 1.97, 2.40, "S09" },
+	{ "S10", 2.40, 2.72, "S10" },
+	{ "S11", 2.72, 2.83, "S11" },
+	{ "S12", 2.83, 3.00, "S12" },
+	{ "S13", 3.00, 3.47, "S13" },
+	{ "S14", 3.47, 3.62, "S14" },
+	{ "S15", 3.62, 6.00, "S15" },
+	{ "S16", 6.00, 6.40, "S16" },
+	{ "S17", 6.40, 7.70, "S17" },
+}
+Shots.SET_ORDER = { "S01", "S02", "S03", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17" }
+
+return Shots
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000006"><Properties><string name="Name">WorldFx</string><ProtectedString name="Source"><![CDATA[-- WorldFx: what OTHER players see when someone casts the ult (they don't get the cinematic).
+-- A charging aura, the slash line at 6.0s and a shockwave + flash at the impact (6.4s).
+
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local Kit = require(script.Parent.Kit)
+local Config = require(script.Parent.Config)
+
+local WorldFx = {}
+
+local function tween(inst: Instance, time: number, props: { [string]: any }, style: Enum.EasingStyle?)
+	local tw = TweenService:Create(inst, TweenInfo.new(time, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
+	tw:Play()
+	return tw
+end
+
+function WorldFx.burst(caster: Player, cf: CFrame)
+	local folder = Instance.new("Folder")
+	folder.Name = "UltQWorldFx"
+	folder.Parent = workspace
+	Debris:AddItem(folder, Config.Duration + 2)
+	local char = caster.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local center = hrp and (hrp :: BasePart).CFrame or cf
+
+	if Config.SoundId ~= "" and hrp then
+		local s = Instance.new("Sound")
+		s.SoundId = Config.SoundId
+		s.Volume = Config.Volume
+		s.RollOffMaxDistance = 200
+		s.Parent = hrp
+		s:Play()
+		Debris:AddItem(s, Config.Duration + 1)
+	end
+
+	-- charging aura
+	local aura = Kit.ball(folder, center, 5, Kit.rgb(0.1, 0.35, 1), 0.6)
+	local light = Instance.new("PointLight")
+	light.Color = Kit.CYAN
+	light.Range = 24
+	light.Brightness = 3
+	light.Parent = aura
+	tween(aura, 0.4, { Size = Vector3.one * 8 }, Enum.EasingStyle.Back)
+	task.spawn(function()
+		local t0 = os.clock()
+		while os.clock() - t0 < 6.0 and aura.Parent do
+			local t = os.clock() - t0
+			aura.Transparency = 0.6 + 0.15 * math.sin(t * 12)
+			if hrp and hrp.Parent then
+				aura.CFrame = (hrp :: BasePart).CFrame
+			end
+			task.wait()
+		end
+		aura:Destroy()
+	end)
+
+	-- 6.0s: the slash line
+	task.delay(6.0, function()
+		if not folder.Parent then
+			return
+		end
+		local line = Kit.part(folder, { Size = Vector3.new(0.3, 0.05, 0.3), CFrame = center * CFrame.Angles(0, 0, math.rad(-12)), Color = Kit.rgb(1, 0.6, 0.9) })
+		tween(line, 0.08, { Size = Vector3.new(0.3, 60, 0.3) })
+		task.delay(0.25, function()
+			tween(line, 0.3, { Transparency = 1, Size = Vector3.new(2, 60, 2) })
+		end)
+	end)
+
+	-- 6.4s: impact shockwave + flash
+	task.delay(Config.HitTime, function()
+		if not folder.Parent then
+			return
+		end
+		local flashBall = Kit.ball(folder, center, 2, Kit.WHITE, 0)
+		tween(flashBall, 0.5, { Size = Vector3.one * 26, Transparency = 1 })
+		local ring = Kit.part(folder, { Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.4, 4, 4), CFrame = center * CFrame.Angles(0, 0, math.rad(90)), Color = Kit.ICE, Transparency = 0.2 })
+		tween(ring, 0.9, { Size = Vector3.new(0.2, 70, 70), Transparency = 1 })
+		local l = Instance.new("PointLight")
+		l.Color = Kit.CYAN
+		l.Range = 60
+		l.Brightness = 10
+		l.Parent = flashBall
+		tween(l, 0.8, { Brightness = 0 })
+		for _ = 1, 16 do
+			local d = Kit.part(folder, { Size = Vector3.one * (math.random() * 0.6 + 0.2), CFrame = center, Color = Kit.ICE })
+			local dir = Vector3.new(math.random() - 0.5, math.random() * 0.6, math.random() - 0.5).Unit * (12 + math.random() * 18)
+			tween(d, 0.8, { CFrame = center + dir, Transparency = 1 })
+		end
+	end)
+end
+
+return WorldFx
+]]></ProtectedString></Properties></Item></Item><Item class="LocalScript" referent="RBX00000008"><Properties><string name="Name">UltQClient</string><ProtectedString name="Source"><![CDATA[-- UltQ client: press Q (or controller Y / the mobile ULT button) to cast.
+-- The server owns the cooldown; when it approves, the caster plays the cinematic and everyone
+-- else sees the world burst around the caster.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ContextActionService = game:GetService("ContextActionService")
+
+local player = Players.LocalPlayer
+local shared = ReplicatedStorage:WaitForChild("UltQShared")
+local Config = require(shared:WaitForChild("Config"))
+local Cinematic = require(shared:WaitForChild("Cinematic"))
+local WorldFx = require(shared:WaitForChild("WorldFx"))
+local remote = ReplicatedStorage:WaitForChild("UltQRemote") :: RemoteEvent
+local gui = script.Parent :: ScreenGui
+
+local playing = false
+local lastRequest = 0
+
+local function onAction(_: string, state: Enum.UserInputState, _: InputObject)
+	if state ~= Enum.UserInputState.Begin then
+		return Enum.ContextActionResult.Pass
+	end
+	if playing or os.clock() - lastRequest < 0.4 then
+		return Enum.ContextActionResult.Sink
+	end
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then
+		return Enum.ContextActionResult.Sink
+	end
+	lastRequest = os.clock()
+	remote:FireServer("cast")
+	return Enum.ContextActionResult.Sink
+end
+
+ContextActionService:BindAction("UltQ", onAction, Config.MobileButton, Config.Key, Config.GamepadKey)
+if Config.MobileButton then
+	ContextActionService:SetTitle("UltQ", "ULT")
+	ContextActionService:SetPosition("UltQ", UDim2.new(1, -170, 1, -170))
+end
+
+remote.OnClientEvent:Connect(function(action: string, caster: Player, cf: CFrame)
+	if action ~= "cast" then
+		return
+	end
+	if caster == player then
+		if playing then
+			return
+		end
+		local char = player.Character
+		if not char then
+			return
+		end
+		playing = true
+		local ok, err = pcall(Cinematic.play, char, gui, function()
+			playing = false
+		end)
+		if not ok then
+			warn("[UltQ] cinematic failed:", err)
+			playing = false
+		end
+	else
+		WorldFx.burst(caster, cf)
+	end
+end)
+]]></ProtectedString></Properties></Item></Item></roblox>
