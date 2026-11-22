@@ -8,6 +8,8 @@ A cinematic ultimate. When you press Q:
 
 Controller: **Y**. Mobile: an on-screen **ULT** button.
 
+**Your weapon:** the cinematic clones your character as it is at the moment you cast, so equip your weapon before you press Q and it appears in every shot. There's no built-in weapon.
+
 ### Install (no plugins needed)
 1. Open your place in Roblox Studio.
 2. Drag **`UltQ.rbxmx`** (in this repo) into the Studio window.
@@ -46,7 +48,7 @@ Roblox only plays audio that's been uploaded to Roblox:
 | `src/UltQ/UltQClient.client.lua` | Q / Y / mobile button input, plays the cinematic or the world FX |
 | `Shared/Cinematic.lua` | Scripted camera, Lighting (bloom / colour grade), flash / glitch / fade overlay; restores everything afterwards |
 | `Shared/Shots.lua` | The 15 shot sets (built from neon parts far above the map, local-only) |
-| `Shared/Rig.lua` | Clones your avatar as an "actor" and poses it through its Motor6Ds (R6 + R15, no animation upload needed) |
+| `Shared/Rig.lua` | Clones your avatar (and your equipped weapon) as an "actor" and poses it through its Motor6Ds (R6 + R15, no animation upload needed) |
 | `Shared/WorldFx.lua` | What other players see |
 | `Shared/Kit.lua` | Part, keyframe and Blender-to-Roblox coordinate helpers |
 

@@ -731,6 +731,8 @@ end
 return Kit
 ]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX00000004"><Properties><string name="Name">Rig</string><ProtectedString name="Source"><![CDATA[-- Rig: clones the player's own avatar into a local-only "actor" and poses it by driving the
 -- Motor6D joints directly (no animation asset upload needed). Works with R6 and R15.
+-- Whatever the player is holding (an equipped Tool / custom weapon) is cloned with them, so
+-- their own weapon appears in every shot.
 -- Pose data is in Blender degrees (same POSES table as ult-blender/ult_build.py).
 
 local Kit = require(script.Parent.Kit)
@@ -739,15 +741,15 @@ local V, R = Kit.V, Kit.R
 local Rig = {}
 
 Rig.POSES = {
-	ready = { torso = { 10, 0, -12 }, head = { -4, 0, 12 }, armL = { -20, 0, 25 }, armR = { -70, 0, -10 }, legL = { -25, 0, 10 }, legR = { 20, 0, -6 }, spear = { 80, 0, 0 } },
-	chest_up = { torso = { 0, 0, 0 }, head = { -3, 0, 0 }, armL = { 0, 0, 8 }, armR = { -25, 0, -10 }, spear = { 150, 0, 0 } },
-	raise = { torso = { -8, 0, 15 }, head = { -10, 0, -5 }, armL = { -40, 0, 30 }, armR = { -160, 0, -15 }, legL = { -10, 0, 0 }, legR = { 10, 0, 0 }, spear = { 170, 0, 0 } },
-	stand_spear = { torso = { 0, 0, 0 }, head = { 0, 0, 0 }, armL = { 0, 0, 6 }, armR = { -30, 0, -8 }, legL = { 0, 0, 3 }, legR = { 0, 0, -3 }, spear = { 120, 0, 0 } },
-	lunge = { torso = { 30, 0, -25 }, head = { -20, 0, 20 }, armL = { 40, 0, 35 }, armR = { -95, 0, -5 }, legL = { -60, 0, 0 }, legR = { 45, 0, 0 }, spear = { 180, 0, 0 } },
-	fly = { torso = { 78, 0, 0 }, head = { -55, 0, 0 }, armL = { 70, 0, 20 }, armR = { -165, 0, -5 }, legL = { 18, 0, 6 }, legR = { 32, 0, -6 }, spear = { 180, 0, 0 } },
-	fly2 = { torso = { 82, 0, 6 }, head = { -60, 0, 0 }, armL = { 80, 0, 30 }, armR = { -172, 0, -10 }, legL = { 25, 0, 8 }, legR = { 10, 0, -8 }, spear = { 182, 0, 0 } },
-	slash = { torso = { 25, 0, 40 }, head = { -15, 0, -30 }, armL = { 60, 0, 40 }, armR = { -80, 0, 80 }, legL = { -50, 0, 0 }, legR = { 55, 0, 0 }, spear = { 150, 0, 0 } },
-	thrust = { torso = { 22, 0, -35 }, head = { -22, 0, 30 }, armL = { 55, 0, 45 }, armR = { -90, 0, 5 }, legL = { -70, 0, 10 }, legR = { 55, 0, -5 }, spear = { 180, 0, 0 } },
+	ready = { torso = { 10, 0, -12 }, head = { -4, 0, 12 }, armL = { -20, 0, 25 }, armR = { -70, 0, -10 }, legL = { -25, 0, 10 }, legR = { 20, 0, -6 } },
+	chest_up = { torso = { 0, 0, 0 }, head = { -3, 0, 0 }, armL = { 0, 0, 8 }, armR = { -25, 0, -10 } },
+	raise = { torso = { -8, 0, 15 }, head = { -10, 0, -5 }, armL = { -40, 0, 30 }, armR = { -160, 0, -15 }, legL = { -10, 0, 0 }, legR = { 10, 0, 0 } },
+	stand = { torso = { 0, 0, 0 }, head = { 0, 0, 0 }, armL = { 0, 0, 6 }, armR = { -30, 0, -8 }, legL = { 0, 0, 3 }, legR = { 0, 0, -3 } },
+	lunge = { torso = { 30, 0, -25 }, head = { -20, 0, 20 }, armL = { 40, 0, 35 }, armR = { -95, 0, -5 }, legL = { -60, 0, 0 }, legR = { 45, 0, 0 } },
+	fly = { torso = { 78, 0, 0 }, head = { -55, 0, 0 }, armL = { 70, 0, 20 }, armR = { -165, 0, -5 }, legL = { 18, 0, 6 }, legR = { 32, 0, -6 } },
+	fly2 = { torso = { 82, 0, 6 }, head = { -60, 0, 0 }, armL = { 80, 0, 30 }, armR = { -172, 0, -10 }, legL = { 25, 0, 8 }, legR = { 10, 0, -8 } },
+	slash = { torso = { 25, 0, 40 }, head = { -15, 0, -30 }, armL = { 60, 0, 40 }, armR = { -80, 0, 80 }, legL = { -50, 0, 0 }, legR = { 55, 0, 0 } },
+	thrust = { torso = { 22, 0, -35 }, head = { -22, 0, 30 }, armL = { 55, 0, 45 }, armR = { -90, 0, 5 }, legL = { -70, 0, 10 }, legR = { 55, 0, -5 } },
 }
 
 local PARTS = { "torso", "head", "armL", "armR", "legL", "legR" }
@@ -849,13 +851,6 @@ function Rig.newActor(character: Model, parent: Instance, stage: CFrame, style: 
 		self.hipToRoot = -hipPos.Y
 	end
 
-	-- spear
-	local handName = rigType == "R15" and "RightHand" or "Right Arm"
-	local hand = clone:FindFirstChild(handName) :: BasePart?
-	if hand then
-		self.spearWeld, self.spearModel = Rig.makeSpear(clone, hand, rigType == "R15" and Vector3.zero or Vector3.new(0, -0.8, 0))
-	end
-
 	self.highlight = Instance.new("Highlight")
 	self.highlight.DepthMode = Enum.HighlightDepthMode.Occluded
 	self.highlight.Adornee = clone
@@ -864,43 +859,6 @@ function Rig.newActor(character: Model, parent: Instance, stage: CFrame, style: 
 
 	clone.Parent = parent
 	return self
-end
-
-function Rig.makeSpear(model: Model, hand: BasePart, grip: Vector3)
-	local folder = Instance.new("Model")
-	folder.Name = "Spear"
-	local root = Kit.part(folder, { Size = Vector3.one * 0.1, Transparency = 1, Name = "SpearRoot" })
-	root.Anchored = false
-	local function piece(p: BasePart, offset: CFrame)
-		p.Anchored = false
-		p.Massless = true
-		local w = Instance.new("Weld")
-		w.Part0 = root
-		w.Part1 = p
-		w.C0 = offset
-		w.Parent = p
-	end
-	-- shaft along +Y (Blender +Z), grip at origin: shaft spans -3 .. 5
-	piece(Kit.part(folder, { Size = Vector3.new(0.14, 8, 0.14), Color = Kit.rgb(0.05, 0.06, 0.1), Material = Enum.Material.Metal }), CFrame.new(0, 1, 0))
-	piece(Kit.part(folder, { Size = Vector3.new(0.06, 6.4, 0.06), Color = Kit.CYAN }), CFrame.new(0, 1.2, -0.07))
-	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.55, 2.6, 0.14), Kit.ICE), CFrame.new(0, 6.2, 0))
-	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.2, 1.2, 0.08), Kit.ICE), CFrame.new(0.35, 5.2, 0) * CFrame.Angles(0, 0, math.rad(-55)))
-	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.2, 1.2, 0.08), Kit.ICE), CFrame.new(-0.35, 5.2, 0) * CFrame.Angles(0, 0, math.rad(55)))
-	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.25, 0.7, 0.25), Kit.ICE), CFrame.new(0, -3.2, 0))
-	local glow = Instance.new("PointLight")
-	glow.Color = Kit.CYAN
-	glow.Range = 10
-	glow.Brightness = 2
-	glow.Parent = root
-
-	local weld = Instance.new("Weld")
-	weld.Part0 = hand
-	weld.Part1 = root
-	weld.C0 = CFrame.new(grip) * R(90, 0, 0)
-	weld.Parent = root
-	weld:SetAttribute("Grip", grip)
-	folder.Parent = model
-	return weld, folder
 end
 
 function Actor:setStyle(style: Style)
@@ -988,11 +946,6 @@ function Actor:update(t: number)
 				drive(j, R(r[1], r[2], r[3]))
 			end
 		end
-	end
-	if self.spearWeld then
-		local sp = lerp3(a.pose.spear or { 90, 0, 0 }, b.pose.spear or { 90, 0, 0 }, f)
-		local grip = self.spearWeld:GetAttribute("Grip") or Vector3.zero
-		self.spearWeld.C0 = CFrame.new(grip * s) * R(sp[1], sp[2], sp[3])
 	end
 	local la, lb = a.loc or Vector3.zero, b.loc or a.loc or Vector3.zero
 	local loc = la:Lerp(lb, f)
@@ -1089,12 +1042,8 @@ function Ctx:onUpdate(fn: (number) -> ())
 	table.insert(self.updaters, fn)
 end
 
-function Ctx:actor(style: Rig.Style, spear: boolean?)
+function Ctx:actor(style: Rig.Style)
 	local a = Rig.newActor(self.char, self.folder, self.stage, style)
-	if spear == false and a.spearModel then
-		a.spearModel:Destroy()
-		a.spearWeld = nil
-	end
 	table.insert(self.actors, a)
 	return a
 end
@@ -1261,10 +1210,10 @@ end
 function Sets.S02(ctx)
 	local rng = Random.new(2)
 	ctx:enclose({ 0, 0, 2 }, 60)
-	local av = ctx:actor("normal", false)
+	local av = ctx:actor("normal")
 	av:key(0.22, P("chest_up", { head = { -6, 0, -8 }, torso = { 0, 0, -10 } }), Vector3.zero)
 	av:key(0.92, P("chest_up", { head = { -2, 0, -14 }, torso = { 0, 0, -14 } }), Vector3.zero)
-	local holo = ctx:actor("ghost", false)
+	local holo = ctx:actor("ghost")
 	holo:key(0.22, P("chest_up", { head = { -6, 0, -8 }, torso = { 0, 0, -10 } }), Vector3.new(0.25, 0.3, 0))
 	local holoT = Kit.track({ { 0.22, 0.9 }, { 0.40, 0.45 }, { 0.67, 0.35 }, { 0.92, 0.8 } })
 	ctx:onUpdate(function(t)
@@ -1317,7 +1266,7 @@ end
 function Sets.S03(ctx)
 	local rng = Random.new(3)
 	ctx:enclose({ 0, 0, 2 }, 60)
-	local av = ctx:actor("silhouette", false)
+	local av = ctx:actor("silhouette")
 	av:key(0.67, P("chest_up", { head = { -10, 0, 10 }, armR = { -40, 0, -30 }, armL = { -30, 0, 30 } }), Vector3.zero)
 	av:key(1.0, P("chest_up", { head = { -14, 0, 14 }, armR = { -50, 0, -35 }, armL = { -40, 0, 35 } }), Vector3.zero)
 	local ink = Kit.rgb(0.02, 0.1, 0.95)
@@ -1367,11 +1316,11 @@ end
 function Sets.S06(ctx)
 	local rng = Random.new(6)
 	ctx:enclose({ 0, 4, 3 }, 60)
-	local av = ctx:actor("normal", false)
+	local av = ctx:actor("normal")
 	av:key(1.0, P("chest_up", { head = { -4, 0, 0 } }), Vector3.zero)
 	av:key(1.47, P("chest_up", { head = { -8, 0, 12 }, torso = { 0, 0, 10 } }), Vector3.zero)
 	for _, c in { { -2.3, 1.4, 25, 1.15 }, { 2.4, 1.6, -28, 1.2 }, { -4.2, 3.0, 35, 1.3 }, { 4.4, 3.2, -35, 1.3 } } do
-		local g = ctx:actor("ghost", false)
+		local g = ctx:actor("ghost")
 		local from = Vector3.new(c[1], c[2], -0.2)
 		local to = from + Vector3.new(c[1] * 0.12, 0.4, 0.15)
 		g:key(1.0, P("chest_up", { head = { -10, 0, c[3] * 0.3 } }), from, { 0, 0, c[3] })
@@ -1407,8 +1356,8 @@ end
 function Sets.S07(ctx)
 	ctx:enclose({ 0, 30, 3 }, 140)
 	local av = ctx:actor("normal")
-	av:key(1.47, P("raise", { spear = { 150, 0, 10 } }), Vector3.zero, { 0, 0, 180 })
-	av:key(1.63, P("raise", { armR = { -175, 0, -20 }, spear = { 170, 0, 20 } }), Vector3.zero, { 0, 0, 180 })
+	av:key(1.47, P("raise"), Vector3.zero, { 0, 0, 180 })
+	av:key(1.63, P("raise", { armR = { -175, 0, -20 } }), Vector3.zero, { 0, 0, 180 })
 	for i = 0, ctx:n(34) - 1 do
 		local col = (i % 3 == 0) and Kit.rgb(0.4, 0.65, 1) or Kit.rgb(0.03, 0.2, 1)
 		local parts, offs = Kit.squareRing(ctx.folder, 16, 0.35, col)
@@ -1428,7 +1377,7 @@ function Sets.S07(ctx)
 	})
 end
 
--- 1.63 Infinite twisting square tunnel + spear-tip star glints
+-- 1.63 Infinite twisting square tunnel + foreground star glints
 function Sets.S08(ctx)
 	ctx:enclose({ 0, 30, 0 }, 140)
 	for i = 0, ctx:n(60) - 1 do
@@ -1443,12 +1392,10 @@ function Sets.S08(ctx)
 	ctx:plate(12, 12, { 0, 62, 0 }, Kit.rgb(0.4, 0.65, 1), 0.1)
 	local av = ctx:actor("dark")
 	av:scale(0.45)
-	av:key(1.63, P("stand_spear", { spear = { 60, 0, 0 }, armR = { -60, 0, -10 } }), Vector3.new(0, 18, -1.2))
-	av:key(1.97, P("stand_spear", { spear = { 66, 0, 0 }, armR = { -66, 0, -12 }, head = { -12, 0, 0 } }), Vector3.new(0, 18, -1.2))
-	-- huge foreground spear + 4-point star glints
+	av:key(1.63, P("stand", { armR = { -60, 0, -10 } }), Vector3.new(0, 18, -1.2))
+	av:key(1.97, P("stand", { armR = { -66, 0, -12 }, head = { -12, 0, 0 } }), Vector3.new(0, 18, -1.2))
+	-- 4-point star glints in the foreground
 	local fs = ctx:at(2.0, 2.2, -0.9, 80, 0, -60)
-	Kit.part(ctx.folder, { Size = Vector3.new(0.16, 6, 0.16), CFrame = fs * CFrame.new(0, -3, 0), Color = Kit.rgb(0.03, 0.03, 0.06), Material = Enum.Material.Metal })
-	Kit.ellipsoid(ctx.folder, fs * CFrame.new(0, 0.7, 0), Vector3.new(0.45, 1.6, 0.1), Kit.ICE)
 	for _, st in { { 0.9, 0.5, 1.66 }, { 0.45, 0.32, 1.72 }, { 1.3, 0.25, 1.78 } } do
 		local center = (fs * CFrame.new(0, st[1], 0)).Position + Vector3.new(0, 0, -0.25)
 		local parts = Kit.star(ctx.folder, Kit.rgb(0.75, 0.88, 1))
@@ -1534,8 +1481,8 @@ function Sets.S10(ctx)
 	local rng = Random.new(10)
 	ctx:enclose({ 0, 2, 2.6 }, 40)
 	local av = ctx:actor("normal")
-	av:key(2.40, P("chest_up", { head = { -8, 0, -18 }, torso = { 4, 0, -20 }, armR = { -120, 0, -40 }, spear = { 100, 0, 40 } }), Vector3.zero)
-	av:key(2.72, P("chest_up", { head = { -12, 0, -8 }, torso = { 4, 0, -14 }, armR = { -130, 0, -45 }, spear = { 100, 0, 40 } }), Vector3.zero)
+	av:key(2.40, P("chest_up", { head = { -8, 0, -18 }, torso = { 4, 0, -20 }, armR = { -120, 0, -40 } }), Vector3.zero)
+	av:key(2.72, P("chest_up", { head = { -12, 0, -8 }, torso = { 4, 0, -14 }, armR = { -130, 0, -45 } }), Vector3.zero)
 	local items = {}
 	for k = 1, ctx:n(10) do
 		local r = rng:NextNumber(1.5, 3.2)

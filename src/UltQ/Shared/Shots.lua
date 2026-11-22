@@ -81,12 +81,8 @@ function Ctx:onUpdate(fn: (number) -> ())
 	table.insert(self.updaters, fn)
 end
 
-function Ctx:actor(style: Rig.Style, spear: boolean?)
+function Ctx:actor(style: Rig.Style)
 	local a = Rig.newActor(self.char, self.folder, self.stage, style)
-	if spear == false and a.spearModel then
-		a.spearModel:Destroy()
-		a.spearWeld = nil
-	end
 	table.insert(self.actors, a)
 	return a
 end
@@ -253,10 +249,10 @@ end
 function Sets.S02(ctx)
 	local rng = Random.new(2)
 	ctx:enclose({ 0, 0, 2 }, 60)
-	local av = ctx:actor("normal", false)
+	local av = ctx:actor("normal")
 	av:key(0.22, P("chest_up", { head = { -6, 0, -8 }, torso = { 0, 0, -10 } }), Vector3.zero)
 	av:key(0.92, P("chest_up", { head = { -2, 0, -14 }, torso = { 0, 0, -14 } }), Vector3.zero)
-	local holo = ctx:actor("ghost", false)
+	local holo = ctx:actor("ghost")
 	holo:key(0.22, P("chest_up", { head = { -6, 0, -8 }, torso = { 0, 0, -10 } }), Vector3.new(0.25, 0.3, 0))
 	local holoT = Kit.track({ { 0.22, 0.9 }, { 0.40, 0.45 }, { 0.67, 0.35 }, { 0.92, 0.8 } })
 	ctx:onUpdate(function(t)
@@ -309,7 +305,7 @@ end
 function Sets.S03(ctx)
 	local rng = Random.new(3)
 	ctx:enclose({ 0, 0, 2 }, 60)
-	local av = ctx:actor("silhouette", false)
+	local av = ctx:actor("silhouette")
 	av:key(0.67, P("chest_up", { head = { -10, 0, 10 }, armR = { -40, 0, -30 }, armL = { -30, 0, 30 } }), Vector3.zero)
 	av:key(1.0, P("chest_up", { head = { -14, 0, 14 }, armR = { -50, 0, -35 }, armL = { -40, 0, 35 } }), Vector3.zero)
 	local ink = Kit.rgb(0.02, 0.1, 0.95)
@@ -359,11 +355,11 @@ end
 function Sets.S06(ctx)
 	local rng = Random.new(6)
 	ctx:enclose({ 0, 4, 3 }, 60)
-	local av = ctx:actor("normal", false)
+	local av = ctx:actor("normal")
 	av:key(1.0, P("chest_up", { head = { -4, 0, 0 } }), Vector3.zero)
 	av:key(1.47, P("chest_up", { head = { -8, 0, 12 }, torso = { 0, 0, 10 } }), Vector3.zero)
 	for _, c in { { -2.3, 1.4, 25, 1.15 }, { 2.4, 1.6, -28, 1.2 }, { -4.2, 3.0, 35, 1.3 }, { 4.4, 3.2, -35, 1.3 } } do
-		local g = ctx:actor("ghost", false)
+		local g = ctx:actor("ghost")
 		local from = Vector3.new(c[1], c[2], -0.2)
 		local to = from + Vector3.new(c[1] * 0.12, 0.4, 0.15)
 		g:key(1.0, P("chest_up", { head = { -10, 0, c[3] * 0.3 } }), from, { 0, 0, c[3] })
@@ -399,8 +395,8 @@ end
 function Sets.S07(ctx)
 	ctx:enclose({ 0, 30, 3 }, 140)
 	local av = ctx:actor("normal")
-	av:key(1.47, P("raise", { spear = { 150, 0, 10 } }), Vector3.zero, { 0, 0, 180 })
-	av:key(1.63, P("raise", { armR = { -175, 0, -20 }, spear = { 170, 0, 20 } }), Vector3.zero, { 0, 0, 180 })
+	av:key(1.47, P("raise"), Vector3.zero, { 0, 0, 180 })
+	av:key(1.63, P("raise", { armR = { -175, 0, -20 } }), Vector3.zero, { 0, 0, 180 })
 	for i = 0, ctx:n(34) - 1 do
 		local col = (i % 3 == 0) and Kit.rgb(0.4, 0.65, 1) or Kit.rgb(0.03, 0.2, 1)
 		local parts, offs = Kit.squareRing(ctx.folder, 16, 0.35, col)
@@ -420,7 +416,7 @@ function Sets.S07(ctx)
 	})
 end
 
--- 1.63 Infinite twisting square tunnel + spear-tip star glints
+-- 1.63 Infinite twisting square tunnel + foreground star glints
 function Sets.S08(ctx)
 	ctx:enclose({ 0, 30, 0 }, 140)
 	for i = 0, ctx:n(60) - 1 do
@@ -435,12 +431,10 @@ function Sets.S08(ctx)
 	ctx:plate(12, 12, { 0, 62, 0 }, Kit.rgb(0.4, 0.65, 1), 0.1)
 	local av = ctx:actor("dark")
 	av:scale(0.45)
-	av:key(1.63, P("stand_spear", { spear = { 60, 0, 0 }, armR = { -60, 0, -10 } }), Vector3.new(0, 18, -1.2))
-	av:key(1.97, P("stand_spear", { spear = { 66, 0, 0 }, armR = { -66, 0, -12 }, head = { -12, 0, 0 } }), Vector3.new(0, 18, -1.2))
-	-- huge foreground spear + 4-point star glints
+	av:key(1.63, P("stand", { armR = { -60, 0, -10 } }), Vector3.new(0, 18, -1.2))
+	av:key(1.97, P("stand", { armR = { -66, 0, -12 }, head = { -12, 0, 0 } }), Vector3.new(0, 18, -1.2))
+	-- 4-point star glints in the foreground
 	local fs = ctx:at(2.0, 2.2, -0.9, 80, 0, -60)
-	Kit.part(ctx.folder, { Size = Vector3.new(0.16, 6, 0.16), CFrame = fs * CFrame.new(0, -3, 0), Color = Kit.rgb(0.03, 0.03, 0.06), Material = Enum.Material.Metal })
-	Kit.ellipsoid(ctx.folder, fs * CFrame.new(0, 0.7, 0), Vector3.new(0.45, 1.6, 0.1), Kit.ICE)
 	for _, st in { { 0.9, 0.5, 1.66 }, { 0.45, 0.32, 1.72 }, { 1.3, 0.25, 1.78 } } do
 		local center = (fs * CFrame.new(0, st[1], 0)).Position + Vector3.new(0, 0, -0.25)
 		local parts = Kit.star(ctx.folder, Kit.rgb(0.75, 0.88, 1))
@@ -526,8 +520,8 @@ function Sets.S10(ctx)
 	local rng = Random.new(10)
 	ctx:enclose({ 0, 2, 2.6 }, 40)
 	local av = ctx:actor("normal")
-	av:key(2.40, P("chest_up", { head = { -8, 0, -18 }, torso = { 4, 0, -20 }, armR = { -120, 0, -40 }, spear = { 100, 0, 40 } }), Vector3.zero)
-	av:key(2.72, P("chest_up", { head = { -12, 0, -8 }, torso = { 4, 0, -14 }, armR = { -130, 0, -45 }, spear = { 100, 0, 40 } }), Vector3.zero)
+	av:key(2.40, P("chest_up", { head = { -8, 0, -18 }, torso = { 4, 0, -20 }, armR = { -120, 0, -40 } }), Vector3.zero)
+	av:key(2.72, P("chest_up", { head = { -12, 0, -8 }, torso = { 4, 0, -14 }, armR = { -130, 0, -45 } }), Vector3.zero)
 	local items = {}
 	for k = 1, ctx:n(10) do
 		local r = rng:NextNumber(1.5, 3.2)

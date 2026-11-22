@@ -1,5 +1,7 @@
 -- Rig: clones the player's own avatar into a local-only "actor" and poses it by driving the
 -- Motor6D joints directly (no animation asset upload needed). Works with R6 and R15.
+-- Whatever the player is holding (an equipped Tool / custom weapon) is cloned with them, so
+-- their own weapon appears in every shot.
 -- Pose data is in Blender degrees (same POSES table as ult-blender/ult_build.py).
 
 local Kit = require(script.Parent.Kit)
@@ -8,15 +10,15 @@ local V, R = Kit.V, Kit.R
 local Rig = {}
 
 Rig.POSES = {
-	ready = { torso = { 10, 0, -12 }, head = { -4, 0, 12 }, armL = { -20, 0, 25 }, armR = { -70, 0, -10 }, legL = { -25, 0, 10 }, legR = { 20, 0, -6 }, spear = { 80, 0, 0 } },
-	chest_up = { torso = { 0, 0, 0 }, head = { -3, 0, 0 }, armL = { 0, 0, 8 }, armR = { -25, 0, -10 }, spear = { 150, 0, 0 } },
-	raise = { torso = { -8, 0, 15 }, head = { -10, 0, -5 }, armL = { -40, 0, 30 }, armR = { -160, 0, -15 }, legL = { -10, 0, 0 }, legR = { 10, 0, 0 }, spear = { 170, 0, 0 } },
-	stand_spear = { torso = { 0, 0, 0 }, head = { 0, 0, 0 }, armL = { 0, 0, 6 }, armR = { -30, 0, -8 }, legL = { 0, 0, 3 }, legR = { 0, 0, -3 }, spear = { 120, 0, 0 } },
-	lunge = { torso = { 30, 0, -25 }, head = { -20, 0, 20 }, armL = { 40, 0, 35 }, armR = { -95, 0, -5 }, legL = { -60, 0, 0 }, legR = { 45, 0, 0 }, spear = { 180, 0, 0 } },
-	fly = { torso = { 78, 0, 0 }, head = { -55, 0, 0 }, armL = { 70, 0, 20 }, armR = { -165, 0, -5 }, legL = { 18, 0, 6 }, legR = { 32, 0, -6 }, spear = { 180, 0, 0 } },
-	fly2 = { torso = { 82, 0, 6 }, head = { -60, 0, 0 }, armL = { 80, 0, 30 }, armR = { -172, 0, -10 }, legL = { 25, 0, 8 }, legR = { 10, 0, -8 }, spear = { 182, 0, 0 } },
-	slash = { torso = { 25, 0, 40 }, head = { -15, 0, -30 }, armL = { 60, 0, 40 }, armR = { -80, 0, 80 }, legL = { -50, 0, 0 }, legR = { 55, 0, 0 }, spear = { 150, 0, 0 } },
-	thrust = { torso = { 22, 0, -35 }, head = { -22, 0, 30 }, armL = { 55, 0, 45 }, armR = { -90, 0, 5 }, legL = { -70, 0, 10 }, legR = { 55, 0, -5 }, spear = { 180, 0, 0 } },
+	ready = { torso = { 10, 0, -12 }, head = { -4, 0, 12 }, armL = { -20, 0, 25 }, armR = { -70, 0, -10 }, legL = { -25, 0, 10 }, legR = { 20, 0, -6 } },
+	chest_up = { torso = { 0, 0, 0 }, head = { -3, 0, 0 }, armL = { 0, 0, 8 }, armR = { -25, 0, -10 } },
+	raise = { torso = { -8, 0, 15 }, head = { -10, 0, -5 }, armL = { -40, 0, 30 }, armR = { -160, 0, -15 }, legL = { -10, 0, 0 }, legR = { 10, 0, 0 } },
+	stand = { torso = { 0, 0, 0 }, head = { 0, 0, 0 }, armL = { 0, 0, 6 }, armR = { -30, 0, -8 }, legL = { 0, 0, 3 }, legR = { 0, 0, -3 } },
+	lunge = { torso = { 30, 0, -25 }, head = { -20, 0, 20 }, armL = { 40, 0, 35 }, armR = { -95, 0, -5 }, legL = { -60, 0, 0 }, legR = { 45, 0, 0 } },
+	fly = { torso = { 78, 0, 0 }, head = { -55, 0, 0 }, armL = { 70, 0, 20 }, armR = { -165, 0, -5 }, legL = { 18, 0, 6 }, legR = { 32, 0, -6 } },
+	fly2 = { torso = { 82, 0, 6 }, head = { -60, 0, 0 }, armL = { 80, 0, 30 }, armR = { -172, 0, -10 }, legL = { 25, 0, 8 }, legR = { 10, 0, -8 } },
+	slash = { torso = { 25, 0, 40 }, head = { -15, 0, -30 }, armL = { 60, 0, 40 }, armR = { -80, 0, 80 }, legL = { -50, 0, 0 }, legR = { 55, 0, 0 } },
+	thrust = { torso = { 22, 0, -35 }, head = { -22, 0, 30 }, armL = { 55, 0, 45 }, armR = { -90, 0, 5 }, legL = { -70, 0, 10 }, legR = { 55, 0, -5 } },
 }
 
 local PARTS = { "torso", "head", "armL", "armR", "legL", "legR" }
@@ -118,13 +120,6 @@ function Rig.newActor(character: Model, parent: Instance, stage: CFrame, style: 
 		self.hipToRoot = -hipPos.Y
 	end
 
-	-- spear
-	local handName = rigType == "R15" and "RightHand" or "Right Arm"
-	local hand = clone:FindFirstChild(handName) :: BasePart?
-	if hand then
-		self.spearWeld, self.spearModel = Rig.makeSpear(clone, hand, rigType == "R15" and Vector3.zero or Vector3.new(0, -0.8, 0))
-	end
-
 	self.highlight = Instance.new("Highlight")
 	self.highlight.DepthMode = Enum.HighlightDepthMode.Occluded
 	self.highlight.Adornee = clone
@@ -133,43 +128,6 @@ function Rig.newActor(character: Model, parent: Instance, stage: CFrame, style: 
 
 	clone.Parent = parent
 	return self
-end
-
-function Rig.makeSpear(model: Model, hand: BasePart, grip: Vector3)
-	local folder = Instance.new("Model")
-	folder.Name = "Spear"
-	local root = Kit.part(folder, { Size = Vector3.one * 0.1, Transparency = 1, Name = "SpearRoot" })
-	root.Anchored = false
-	local function piece(p: BasePart, offset: CFrame)
-		p.Anchored = false
-		p.Massless = true
-		local w = Instance.new("Weld")
-		w.Part0 = root
-		w.Part1 = p
-		w.C0 = offset
-		w.Parent = p
-	end
-	-- shaft along +Y (Blender +Z), grip at origin: shaft spans -3 .. 5
-	piece(Kit.part(folder, { Size = Vector3.new(0.14, 8, 0.14), Color = Kit.rgb(0.05, 0.06, 0.1), Material = Enum.Material.Metal }), CFrame.new(0, 1, 0))
-	piece(Kit.part(folder, { Size = Vector3.new(0.06, 6.4, 0.06), Color = Kit.CYAN }), CFrame.new(0, 1.2, -0.07))
-	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.55, 2.6, 0.14), Kit.ICE), CFrame.new(0, 6.2, 0))
-	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.2, 1.2, 0.08), Kit.ICE), CFrame.new(0.35, 5.2, 0) * CFrame.Angles(0, 0, math.rad(-55)))
-	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.2, 1.2, 0.08), Kit.ICE), CFrame.new(-0.35, 5.2, 0) * CFrame.Angles(0, 0, math.rad(55)))
-	piece(Kit.ellipsoid(folder, CFrame.identity, Vector3.new(0.25, 0.7, 0.25), Kit.ICE), CFrame.new(0, -3.2, 0))
-	local glow = Instance.new("PointLight")
-	glow.Color = Kit.CYAN
-	glow.Range = 10
-	glow.Brightness = 2
-	glow.Parent = root
-
-	local weld = Instance.new("Weld")
-	weld.Part0 = hand
-	weld.Part1 = root
-	weld.C0 = CFrame.new(grip) * R(90, 0, 0)
-	weld.Parent = root
-	weld:SetAttribute("Grip", grip)
-	folder.Parent = model
-	return weld, folder
 end
 
 function Actor:setStyle(style: Style)
@@ -257,11 +215,6 @@ function Actor:update(t: number)
 				drive(j, R(r[1], r[2], r[3]))
 			end
 		end
-	end
-	if self.spearWeld then
-		local sp = lerp3(a.pose.spear or { 90, 0, 0 }, b.pose.spear or { 90, 0, 0 }, f)
-		local grip = self.spearWeld:GetAttribute("Grip") or Vector3.zero
-		self.spearWeld.C0 = CFrame.new(grip * s) * R(sp[1], sp[2], sp[3])
 	end
 	local la, lb = a.loc or Vector3.zero, b.loc or a.loc or Vector3.zero
 	local loc = la:Lerp(lb, f)
